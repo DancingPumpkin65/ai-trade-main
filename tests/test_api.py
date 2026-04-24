@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 
 from trading_agents.api.deps import get_services
 from trading_agents.api.main import app
-from trading_agents.core.models import GenerateSignalRequest, NewsChunk, StockInfo
+from trading_agents.core.models import GenerateSignalRequest, NewsChunk, RiskOutput, StockInfo
 from trading_agents.graph import build as graph_build
 from trading_agents.graph.technical_node import run_technical_agent as actual_run_technical_agent
 
@@ -141,6 +141,88 @@ def test_human_review_approve_flow(tmp_path: Path, monkeypatch):
     assert payload["status"] == "COMPLETED"
     assert payload["final_signal"]["request_id"] == request_id
     assert payload["alpaca_order_status"] in {"UNMAPPABLE", "PREPARED"}
+
+
+def test_alpaca_preview_is_unmappable_after_approval_without_symbol_mapping(tmp_path: Path, monkeypatch):
+    _configure_env(tmp_path, monkeypatch)
+    client = TestClient(app)
+    services = get_services()
+
+    async def fake_get_stock(symbol: str):
+        return _volatile_stock(symbol)
+
+    services.graph_service.drahmi_client.get_stock = fake_get_stock
+
+    response = client.post("/signals/generate", json={"prompt": "Analyze ATW"})
+    assert response.status_code == 200
+    request_id = response.json()["request_id"]
+
+    approved = client.post(f"/signals/{request_id}/approve")
+    assert approved.status_code == 200
+    payload = approved.json()
+    assert payload["alpaca_order_status"] == "UNMAPPABLE"
+    assert payload["alpaca_order"]["source_symbol"] == "ATW"
+    assert payload["alpaca_order"]["alpaca_symbol"] is None
+    assert payload["alpaca_order"]["status"] == "UNMAPPABLE"
+
+    alpaca_detail = client.get(f"/signals/{request_id}/alpaca-order")
+    assert alpaca_detail.status_code == 200
+    alpaca_payload = alpaca_detail.json()
+    assert alpaca_payload["alpaca_order_status"] == "UNMAPPABLE"
+    assert alpaca_payload["alpaca_order"]["reason"]
+
+
+def test_alpaca_preview_is_prepared_after_approval_with_symbol_mapping(tmp_path: Path, monkeypatch):
+    _configure_env(tmp_path, monkeypatch)
+    client = TestClient(app)
+    services = get_services()
+    services.graph_service.alpaca_preview_service.register_symbol_mapping("ATW", "SPY")
+
+    async def fake_get_stock(symbol: str):
+        return _volatile_stock(symbol)
+
+    def fake_run_risk_agent(*, symbol, capital, sentiment_output, technical_output, technical_features, request_intent):
+        return RiskOutput(
+            action="BUY",
+            position_size_pct=0.03,
+            position_value_mad=capital * 0.03,
+            stop_loss_pct=0.05,
+            take_profit_pct=0.08,
+            risk_score=0.72,
+            volatility_estimate=0.65,
+            rationale="Forced BUY risk output for approval-preview integration test.",
+        )
+
+    services.graph_service.drahmi_client.get_stock = fake_get_stock
+    monkeypatch.setattr(graph_build, "run_risk_agent", fake_run_risk_agent)
+
+    response = client.post("/signals/generate", json={"prompt": "Analyze ATW"})
+    assert response.status_code == 200
+    request_id = response.json()["request_id"]
+
+    approved = client.post(f"/signals/{request_id}/approve")
+    assert approved.status_code == 200
+    payload = approved.json()
+    assert payload["alpaca_order_status"] == "PREPARED"
+    assert payload["alpaca_order"]["source_symbol"] == "ATW"
+    assert payload["alpaca_order"]["alpaca_symbol"] == "SPY"
+    assert payload["alpaca_order"]["side"] in {"buy", "sell"}
+    assert payload["alpaca_order"]["type"] == "market"
+    assert payload["alpaca_order"]["time_in_force"] == "day"
+    assert payload["alpaca_order"]["preview_only"] is True
+    assert payload["alpaca_order"]["submission_eligible"] is False
+
+    detail = client.get(f"/signals/{request_id}")
+    assert detail.status_code == 200
+    detail_payload = detail.json()
+    assert detail_payload["alpaca_order_status"] == "PREPARED"
+    assert detail_payload["alpaca_order"]["alpaca_symbol"] == "SPY"
+
+    alpaca_detail = client.get(f"/signals/{request_id}/alpaca-order")
+    assert alpaca_detail.status_code == 200
+    alpaca_payload = alpaca_detail.json()
+    assert alpaca_payload["alpaca_order_status"] == "PREPARED"
+    assert alpaca_payload["alpaca_order"]["client_order_id"] == request_id
 
 
 def test_human_review_reject_flow(tmp_path: Path, monkeypatch):

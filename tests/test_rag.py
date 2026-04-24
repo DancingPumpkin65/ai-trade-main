@@ -51,3 +51,49 @@ def test_retriever_merges_news_and_macro_documents(tmp_path: Path):
     ids = {item.chunk_id for item in results}
     assert "news-1" in ids
     assert "doc-1" in ids
+
+
+def test_retriever_logs_search_metadata_to_tracer(tmp_path: Path):
+    class FakeTracer:
+        def __init__(self):
+            self.calls = []
+
+        def log_search(self, **kwargs):
+            self.calls.append(kwargs)
+
+    store = InMemoryVectorStore()
+    indexer = Indexer(store)
+    tracer = FakeTracer()
+    retriever = NewsRetriever(store, tracer=tracer)
+    now = datetime.now(timezone.utc)
+
+    indexer.upsert_news(
+        [
+            NewsChunk(
+                chunk_id="news-2",
+                text="ATW earnings Morocco",
+                source="Sample News",
+                published_at=now,
+                url="https://example.com/atw-earnings",
+                metadata={"doc_type": "news"},
+            )
+        ]
+    )
+
+    results = retriever.search_news(
+        "ATW earnings",
+        top_k=3,
+        filters={"ticker": "ATW"},
+        metadata={"request_id": "req-123", "symbol": "ATW", "query_source": "sentiment_tool"},
+    )
+
+    assert len(results) == 1
+    assert len(tracer.calls) == 1
+    call = tracer.calls[0]
+    assert call["query"] == "ATW earnings"
+    assert call["top_k"] == 3
+    assert call["filters"] == {"ticker": "ATW"}
+    assert call["collections"] == ["news", "macro_documents"]
+    assert call["metadata"]["request_id"] == "req-123"
+    assert call["metadata"]["symbol"] == "ATW"
+    assert call["results"][0].chunk_id == "news-2"

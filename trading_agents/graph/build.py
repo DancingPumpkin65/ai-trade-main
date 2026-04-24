@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -94,6 +94,7 @@ class TradingGraphService:
         self.retriever = NewsRetriever(self.vector_store)
         self.bourse_fetcher = BourseDataFetcher(bourse_cache_dir or Path("./data/bourse_pdfs"))
         self._last_bourse_ingestion_date: date | None = None
+        self._issuer_ingestion_cache: set[tuple[date, str]] = set()
         self.mcp = MCPServer()
         self._active_state_context: dict[str, Any] = {}
         self._register_tools()
@@ -230,6 +231,7 @@ class TradingGraphService:
         if symbol:
             global_news = await self.marketaux_client.fetch_for_symbol(symbol)
             self.indexer.upsert_news(global_news)
+            await self.ingest_issuer_publications(symbol)
 
     async def ingest_bourse_documents(self) -> None:
         today = datetime.now(timezone.utc).date()
@@ -248,6 +250,25 @@ class TradingGraphService:
                 },
             )
         self._last_bourse_ingestion_date = today
+
+    async def ingest_issuer_publications(self, symbol: str) -> None:
+        today = datetime.now(timezone.utc).date()
+        cache_key = (today, symbol.upper())
+        if cache_key in self._issuer_ingestion_cache:
+            return
+        stock = await self.drahmi_client.get_stock(symbol)
+        chunks = await self.bourse_fetcher.fetch_issuer_publication_chunks([stock], limit_pdfs=3)
+        if chunks:
+            self.indexer.upsert_macro_documents(chunks)
+            self.storage.add_event(
+                "system",
+                "issuer_publication_ingestion",
+                {
+                    "symbol": stock.symbol,
+                    "indexed_chunks": len(chunks),
+                },
+            )
+        self._issuer_ingestion_cache.add(cache_key)
 
     def start(self, intent: RequestIntent) -> None:
         self.storage.update_request(intent.request_id, status=SignalStatus.RUNNING)

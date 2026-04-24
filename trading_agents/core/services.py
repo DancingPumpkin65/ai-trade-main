@@ -59,15 +59,21 @@ class AppServices:
             morocco_news_client=self.morocco_news_client,
             marketaux_client=self.marketaux_client,
             alpaca_preview_service=self.alpaca_preview_service,
+            checkpoint_path=settings.langgraph_checkpoint_path,
         )
         self.auth_service = AuthService(self.storage, settings.secret_key)
+
+    def close(self) -> None:
+        self.graph_service.close()
 
     def health(self) -> dict:
         return {
             "status": "ok",
             "db_path": str(self.settings.db_path),
+            "langgraph_checkpoint_path": str(self.settings.langgraph_checkpoint_path),
             "langsmith_tracing": self.settings.langsmith_tracing,
             "alpaca_enabled": self.settings.alpaca_enabled,
+            "langgraph_enabled": self.graph_service.langgraph_enabled,
         }
 
     def generate(self, payload: GenerateSignalRequest) -> GenerateSignalResponse:

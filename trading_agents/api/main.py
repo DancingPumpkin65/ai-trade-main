@@ -10,8 +10,11 @@ from trading_agents.api.deps import get_services
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    get_services()
-    yield
+    services = get_services()
+    try:
+        yield
+    finally:
+        services.close()
 
 
 app = FastAPI(title="Morocco Trading Agents", lifespan=lifespan)

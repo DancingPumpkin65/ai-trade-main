@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import calendar
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from hashlib import md5
+from html import unescape
 from pathlib import Path
-import calendar
 import re
+import unicodedata
+from urllib.parse import urljoin, urlparse
 
 import httpx
 import pdfplumber
 
-from trading_agents.core.models import NewsChunk
+from trading_agents.core.models import NewsChunk, StockInfo
 
 
 NOTICE_DATE_PATTERN = re.compile(r"^(?P<date>\d{2}/\d{2}/\d{4})\s*(?P<text>.*)$")
@@ -23,6 +26,16 @@ SECTOR_ROW_PATTERN = re.compile(
 MASI_PATTERN = re.compile(r"MASI\s*[:\-]?\s*(?P<value>[\d\s.,]+)")
 PERCENT_PATTERN = re.compile(r"(?P<value>[+\-]?[\d\s.,]+)%")
 VOLUME_PATTERN = re.compile(r"volume(?:\s+global)?\s*[:\-]?\s*(?P<value>[\d\s.,]+)", re.IGNORECASE)
+ISSUER_CARD_PATTERN = re.compile(
+    r"<p[^>]*>(?P<issuer>[^<]+)</p>\s*"
+    r"<p[^>]*>(?P<date>\d{2}/\d{2}/\d{4})</p>.*?"
+    r"<a[^>]+href=\"(?P<url>https://media\.casablanca-bourse\.com[^\"]+?\.pdf(?:\?[^\"]*)?)\"[^>]*>\s*"
+    r"<h3[^>]*>(?P<title>.*?)</h3>",
+    re.IGNORECASE | re.DOTALL,
+)
+WHITESPACE_PATTERN = re.compile(r"\s+")
+PUBLICATIONS_PAGE_URL = "https://www.casablanca-bourse.com/fr/publications-des-emetteurs"
+DEFAULT_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; TradingBot/1.0)"}
 
 
 @dataclass(slots=True)
@@ -31,6 +44,15 @@ class PdfTarget:
     target_date: date
     url: str
     filename: str
+
+
+@dataclass(slots=True)
+class IssuerPublicationEntry:
+    issuer_name: str
+    title: str
+    published_date: date
+    url: str
+    ticker: str | None = None
 
 
 @dataclass(slots=True)
@@ -84,12 +106,56 @@ class BourseDataFetcher:
         async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
             return await self._download_if_needed(client, target)
 
+    async def fetch_issuer_publication_chunks(self, stocks: list[StockInfo], limit_pdfs: int = 3) -> list[NewsChunk]:
+        if not stocks or limit_pdfs <= 0:
+            return []
+        try:
+            async with httpx.AsyncClient(timeout=15.0, headers=DEFAULT_HEADERS) as client:
+                response = await client.get(PUBLICATIONS_PAGE_URL)
+                response.raise_for_status()
+                entries = self.parse_issuer_publications_page(response.text)
+                matched_entries = self.match_issuer_publications(entries, stocks)[:limit_pdfs]
+                chunks: list[NewsChunk] = []
+                for entry in matched_entries:
+                    pdf_path = await self._download_issuer_publication_if_needed(client, entry.url)
+                    if pdf_path is None:
+                        continue
+                    chunks.extend(
+                        self.extract_issuer_publication_chunks(
+                            pdf_path=pdf_path,
+                            ticker=entry.ticker or "",
+                            issuer_name=entry.issuer_name,
+                            title=entry.title,
+                            published_date=entry.published_date,
+                            publication_url=entry.url,
+                        )
+                    )
+                return chunks
+        except Exception:
+            return []
+
     async def _download_if_needed(self, client: httpx.AsyncClient, target: PdfTarget) -> Path | None:
         destination = self.cache_dir / target.filename
         if destination.exists():
             return destination
         try:
             response = await client.get(target.url)
+            if response.status_code == 200:
+                destination.write_bytes(response.content)
+                return destination
+            return None
+        except Exception:
+            return None
+
+    async def _download_issuer_publication_if_needed(self, client: httpx.AsyncClient, url: str) -> Path | None:
+        filename = Path(urlparse(url).path).name
+        if not filename:
+            return None
+        destination = self.cache_dir / filename
+        if destination.exists():
+            return destination
+        try:
+            response = await client.get(url, follow_redirects=True)
             if response.status_code == 200:
                 destination.write_bytes(response.content)
                 return destination
@@ -108,10 +174,152 @@ class BourseDataFetcher:
             return []
         return self.extract_chunks_from_text(text=text, source_key=pdf_path.name, target_date=target_date or date.today(), period_type=period_type)
 
+    def extract_issuer_publication_chunks(
+        self,
+        *,
+        pdf_path: Path,
+        ticker: str,
+        issuer_name: str,
+        title: str,
+        published_date: date,
+        publication_url: str,
+    ) -> list[NewsChunk]:
+        pages: list[str] = []
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                text = (page.extract_text() or "").strip()
+                if text:
+                    pages.append(text)
+        return self.extract_issuer_publication_chunks_from_pages(
+            pages=pages,
+            source_key=pdf_path.name,
+            ticker=ticker,
+            issuer_name=issuer_name,
+            title=title,
+            published_date=published_date,
+            publication_url=publication_url,
+        )
+
+    def extract_issuer_publication_chunks_from_pages(
+        self,
+        *,
+        pages: list[str],
+        source_key: str,
+        ticker: str,
+        issuer_name: str,
+        title: str,
+        published_date: date,
+        publication_url: str,
+    ) -> list[NewsChunk]:
+        clean_pages = [page.strip() for page in pages if page and page.strip()]
+        if not clean_pages:
+            return []
+        chunks: list[NewsChunk] = []
+        summary_pages = clean_pages[:2]
+        summary_page_end = min(2, len(summary_pages))
+        chunks.append(
+            self._issuer_publication_chunk(
+                source_key=source_key,
+                text=self._build_issuer_publication_chunk_text(
+                    ticker=ticker,
+                    issuer_name=issuer_name,
+                    title=title,
+                    published_date=published_date,
+                    publication_url=publication_url,
+                    page_start=1,
+                    page_end=summary_page_end,
+                    pages=summary_pages,
+                ),
+                ticker=ticker,
+                issuer_name=issuer_name,
+                title=title,
+                published_date=published_date,
+                publication_url=publication_url,
+                page_start=1,
+                page_end=summary_page_end,
+                chunk_role="summary",
+            )
+        )
+        for offset in range(2, len(clean_pages), 3):
+            page_group = clean_pages[offset : offset + 3]
+            page_start = offset + 1
+            page_end = offset + len(page_group)
+            chunks.append(
+                self._issuer_publication_chunk(
+                    source_key=source_key,
+                    text=self._build_issuer_publication_chunk_text(
+                        ticker=ticker,
+                        issuer_name=issuer_name,
+                        title=title,
+                        published_date=published_date,
+                        publication_url=publication_url,
+                        page_start=page_start,
+                        page_end=page_end,
+                        pages=page_group,
+                    ),
+                    ticker=ticker,
+                    issuer_name=issuer_name,
+                    title=title,
+                    published_date=published_date,
+                    publication_url=publication_url,
+                    page_start=page_start,
+                    page_end=page_end,
+                    chunk_role="continuation",
+                )
+            )
+        return chunks
+
     def extract_chunks_from_text(self, *, text: str, source_key: str, target_date: date, period_type: str) -> list[NewsChunk]:
         if period_type == "daily":
             return self._extract_daily_chunks(text, source_key, target_date)
         return self._extract_period_chunks(text, source_key, target_date, period_type)
+
+    def parse_issuer_publications_page(self, html: str) -> list[IssuerPublicationEntry]:
+        entries: list[IssuerPublicationEntry] = []
+        for match in ISSUER_CARD_PATTERN.finditer(html):
+            issuer_name = self._clean_html_text(match.group("issuer"))
+            title = self._clean_html_text(match.group("title"))
+            url = urljoin(PUBLICATIONS_PAGE_URL, unescape(match.group("url")))
+            try:
+                published_date = datetime.strptime(match.group("date"), "%d/%m/%Y").date()
+            except ValueError:
+                continue
+            if not issuer_name or not title or not url:
+                continue
+            entries.append(
+                IssuerPublicationEntry(
+                    issuer_name=issuer_name,
+                    title=title,
+                    published_date=published_date,
+                    url=url,
+                )
+            )
+        return entries
+
+    def match_issuer_publications(self, entries: list[IssuerPublicationEntry], stocks: list[StockInfo]) -> list[IssuerPublicationEntry]:
+        matched: list[IssuerPublicationEntry] = []
+        for entry in entries:
+            best_ticker: str | None = None
+            best_alias_length = -1
+            haystack = self._normalize_match_text(f"{entry.issuer_name} {entry.title}")
+            for stock in stocks:
+                for alias in self._stock_aliases(stock):
+                    if alias and alias in haystack and len(alias) > best_alias_length:
+                        best_ticker = stock.symbol.upper()
+                        best_alias_length = len(alias)
+            if best_ticker is None:
+                continue
+            matched.append(
+                IssuerPublicationEntry(
+                    issuer_name=entry.issuer_name,
+                    title=entry.title,
+                    published_date=entry.published_date,
+                    url=entry.url,
+                    ticker=best_ticker,
+                )
+            )
+        matched.sort(key=lambda item: item.published_date, reverse=True)
+        return matched
 
     def _extract_daily_chunks(self, text: str, source_key: str, target_date: date) -> list[NewsChunk]:
         chunks: list[NewsChunk] = []
@@ -232,6 +440,28 @@ class BourseDataFetcher:
         lines = [heading] + [f"  [{item['date']}] {item['text']}" for item in notices]
         return self._chunk(source_key, doc_type, "\n".join(lines), target_date)
 
+    def _build_issuer_publication_chunk_text(
+        self,
+        *,
+        ticker: str,
+        issuer_name: str,
+        title: str,
+        published_date: date,
+        publication_url: str,
+        page_start: int,
+        page_end: int,
+        pages: list[str],
+    ) -> str:
+        body = "\n\n".join(pages)
+        return (
+            f"Publication emetteur — {ticker} — {issuer_name}\n"
+            f"Titre: {title}\n"
+            f"Date: {published_date.isoformat()}\n"
+            f"Source: {publication_url}\n"
+            f"Pages: {page_start}-{page_end}\n\n"
+            f"{body}"
+        )
+
     def _build_period_market_summary_text(self, text: str, target_date: date, period_type: str) -> str | None:
         masi_value = self._extract_first_number(MASI_PATTERN, text)
         if masi_value is None:
@@ -319,6 +549,29 @@ class BourseDataFetcher:
         cleaned = value.replace("\xa0", "").replace(" ", "").replace(".", "").replace(",", ".")
         return cleaned
 
+    def _clean_html_text(self, value: str) -> str:
+        without_tags = re.sub(r"<[^>]+>", " ", unescape(value))
+        return WHITESPACE_PATTERN.sub(" ", without_tags).strip()
+
+    def _normalize_match_text(self, value: str) -> str:
+        ascii_text = unicodedata.normalize("NFKD", value)
+        ascii_text = "".join(char for char in ascii_text if not unicodedata.combining(char))
+        ascii_text = ascii_text.lower()
+        ascii_text = re.sub(r"[^a-z0-9]+", " ", ascii_text)
+        return WHITESPACE_PATTERN.sub(" ", ascii_text).strip()
+
+    def _stock_aliases(self, stock: StockInfo) -> set[str]:
+        normalized_name = self._normalize_match_text(stock.name)
+        aliases = {
+            self._normalize_match_text(stock.symbol),
+            normalized_name,
+            normalized_name.replace(" ", ""),
+        }
+        tokens = normalized_name.split()
+        if len(tokens) >= 2:
+            aliases.add(" ".join(tokens[:2]))
+        return {alias for alias in aliases if len(alias) >= 2}
+
     def _chunk(self, source_key: str, doc_type: str, text: str, target_date: date, metadata: dict | None = None) -> NewsChunk:
         meta = {"doc_type": doc_type, **(metadata or {})}
         chunk_id = md5(f"{source_key}|{doc_type}|{text[:120]}".encode("utf-8")).hexdigest()
@@ -330,6 +583,43 @@ class BourseDataFetcher:
             similarity_score=1.0,
             url=None,
             metadata=meta,
+        )
+
+    def _issuer_publication_chunk(
+        self,
+        *,
+        source_key: str,
+        text: str,
+        ticker: str,
+        issuer_name: str,
+        title: str,
+        published_date: date,
+        publication_url: str,
+        page_start: int,
+        page_end: int,
+        chunk_role: str,
+    ) -> NewsChunk:
+        metadata = {
+            "doc_type": "issuer_publication",
+            "ticker": ticker,
+            "issuer_name": issuer_name,
+            "title": title,
+            "publication_url": publication_url,
+            "page_start": page_start,
+            "page_end": page_end,
+            "chunk_role": chunk_role,
+        }
+        chunk_id = md5(
+            f"{source_key}|issuer_publication|{ticker}|{page_start}|{page_end}|{text[:120]}".encode("utf-8")
+        ).hexdigest()
+        return NewsChunk(
+            chunk_id=chunk_id,
+            text=text,
+            source="Casablanca Bourse Issuer Publication",
+            published_at=datetime.combine(published_date, datetime.min.time(), tzinfo=timezone.utc),
+            similarity_score=1.0,
+            url=publication_url,
+            metadata=metadata,
         )
 
     def last_completed_trading_days(self, count: int = 10) -> list[date]:

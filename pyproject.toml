@@ -32,6 +32,7 @@ integrations = [
   "langchain-core>=0.3.0",
   "langsmith>=0.1.140",
   "chromadb>=0.5.5",
+  "sentence-transformers>=3.0.0",
 ]
 
 [tool.pytest.ini_options]

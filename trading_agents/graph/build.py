@@ -29,7 +29,7 @@ from trading_agents.core.models import (
 )
 from trading_agents.core.rag.indexer import Indexer
 from trading_agents.core.rag.retriever import NewsRetriever
-from trading_agents.core.rag.store import InMemoryVectorStore
+from trading_agents.core.rag.store import build_vector_store
 from trading_agents.core.storage import Storage
 from trading_agents.graph.coordinator_node import run_coordinator_agent
 from trading_agents.graph.enforce_limits import enforce_limits
@@ -68,6 +68,8 @@ class TradingGraphService:
         marketaux_client: MarketAuxClient,
         alpaca_preview_service: AlpacaPreviewService,
         checkpoint_path: Path | None = None,
+        chroma_persist_dir: Path | None = None,
+        env: str = "dev",
         max_agent_iterations: int = 8,
     ):
         self.storage = storage
@@ -76,9 +78,15 @@ class TradingGraphService:
         self.marketaux_client = marketaux_client
         self.alpaca_preview_service = alpaca_preview_service
         self.checkpoint_path = checkpoint_path
+        self.chroma_persist_dir = chroma_persist_dir
+        self.env = env
         self.max_agent_iterations = max_agent_iterations
         self.policy_engine = IntentPolicyEngine()
-        self.vector_store = InMemoryVectorStore()
+        self.vector_store = build_vector_store(
+            persist_dir=chroma_persist_dir or Path("./data/chroma"),
+            env=env,
+            prefer_chroma=True,
+        )
         self.indexer = Indexer(self.vector_store)
         self.retriever = NewsRetriever(self.vector_store)
         self.mcp = MCPServer()

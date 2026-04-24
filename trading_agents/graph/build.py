@@ -33,7 +33,7 @@ from trading_agents.core.rag.store import InMemoryVectorStore
 from trading_agents.core.storage import Storage
 from trading_agents.graph.coordinator_node import run_coordinator_agent
 from trading_agents.graph.enforce_limits import enforce_limits
-from trading_agents.graph.helpers import analyze_technical_features
+from trading_agents.graph.helpers import analyze_technical_features, calculate_position_size
 from trading_agents.graph.risk_node import run_risk_agent
 from trading_agents.graph.sentiment_node import run_sentiment_agent
 from trading_agents.graph.state import GraphState
@@ -68,6 +68,7 @@ class TradingGraphService:
         marketaux_client: MarketAuxClient,
         alpaca_preview_service: AlpacaPreviewService,
         checkpoint_path: Path | None = None,
+        max_agent_iterations: int = 8,
     ):
         self.storage = storage
         self.drahmi_client = drahmi_client
@@ -75,11 +76,13 @@ class TradingGraphService:
         self.marketaux_client = marketaux_client
         self.alpaca_preview_service = alpaca_preview_service
         self.checkpoint_path = checkpoint_path
+        self.max_agent_iterations = max_agent_iterations
         self.policy_engine = IntentPolicyEngine()
         self.vector_store = InMemoryVectorStore()
         self.indexer = Indexer(self.vector_store)
         self.retriever = NewsRetriever(self.vector_store)
         self.mcp = MCPServer()
+        self._active_state_context: dict[str, Any] = {}
         self._register_tools()
 
         self.langgraph_enabled = LANGGRAPH_AVAILABLE
@@ -142,6 +145,70 @@ class TradingGraphService:
         self.mcp.register_tool("sentiment", "get_market_data", lambda symbol: asyncio.run(self.drahmi_client.get_stock(symbol)))
         self.mcp.register_tool("technical", "get_market_data", lambda symbol: asyncio.run(self.drahmi_client.get_stock(symbol)))
         self.mcp.register_tool("technical", "analyze_technical", lambda symbol: analyze_technical_features(asyncio.run(self.drahmi_client.get_stock(symbol))))
+        self.mcp.register_tool("risk", "get_sentiment_output", lambda: self._active_state_context.get("sentiment_output"))
+        self.mcp.register_tool("risk", "get_technical_output", lambda: self._active_state_context.get("technical_output"))
+        self.mcp.register_tool("risk", "calculate_size", self._calculate_size_from_active_context)
+        self.mcp.register_tool(
+            "coordinator",
+            "get_all_outputs",
+            lambda: {
+                "sentiment": self._active_state_context.get("sentiment_output"),
+                "technical": self._active_state_context.get("technical_output"),
+                "risk": self._active_state_context.get("risk_output"),
+            },
+        )
+
+    def _calculate_size_from_active_context(self, symbol: str, action: str, capital: float):
+        technical_features = self._active_state_context.get("technical_features") or {}
+        request_intent = self._active_state_context.get("request_intent")
+        conservative_posture = bool(request_intent and request_intent.risk_preference.value == "CONSERVATIVE")
+        sizing = calculate_position_size(
+            symbol=symbol,
+            action=action,
+            capital=capital,
+            volatility_estimate=float(technical_features.get("annualized_volatility", 0.2)),
+            is_fixing_mode=bool(technical_features.get("is_fixing_mode")),
+            conservative_posture=conservative_posture,
+        )
+        return sizing
+
+    def _record_tool_interaction(self, request_id: str, agent: str, tool_name: str, args: dict[str, Any], result: Any) -> None:
+        self.storage.add_event(request_id, "tool_call", {"agent": agent, "tool": tool_name, "args": args})
+        payload = result.model_dump(mode="json") if hasattr(result, "model_dump") else result
+        self.storage.add_event(request_id, "tool_result", {"agent": agent, "tool": tool_name, "result": payload})
+
+    def _safe_sentiment_output(self, symbol: str, note: str) -> SentimentOutput:
+        return SentimentOutput(
+            sentiment_score=0.5,
+            catalysts=[],
+            cited_article_ids=[],
+            confidence=0.2,
+            rationale_fr=f"Analyse de sentiment prudente pour {symbol}. {note}",
+        )
+
+    def _safe_risk_output(self, request_intent: RequestIntent, technical_output: TechnicalOutput) -> RiskOutput:
+        return RiskOutput(
+            action="HOLD",
+            position_size_pct=0.0,
+            position_value_mad=0.0,
+            stop_loss_pct=min(0.02, 0.06 if technical_output.volatility_estimate > 0 else 0.10),
+            take_profit_pct=0.03,
+            risk_score=0.2,
+            volatility_estimate=technical_output.volatility_estimate,
+            rationale=f"Fallback safe output. Risk preference: {request_intent.risk_preference.value}.",
+        )
+
+    def _safe_coordinator_output(self, symbol: str, request_intent: RequestIntent) -> CoordinatorOutput:
+        return CoordinatorOutput(
+            action="HOLD",
+            position_size_pct=0.0,
+            stop_loss_pct=0.02,
+            take_profit_pct=0.03,
+            risk_score=0.2,
+            rationale_fr=f"Demande comprise: {request_intent.operator_visible_note_fr} Conclusion système sur {symbol}: HOLD par défaut de sécurité.",
+            dissenting_views=[],
+            confidence=0.2,
+        )
 
     async def ingest_news(self, symbol: str | None = None) -> None:
         morocco_news = await self.morocco_news_client.fetch()
@@ -347,6 +414,181 @@ class TradingGraphService:
                 f"calculée en Python ({ground_truth_bias}). Réévaluez uniquement la narration, pas les nombres."
             )
 
+    def _run_sentiment_loop(
+        self,
+        *,
+        request_id: str,
+        symbol: str,
+        request_intent: RequestIntent,
+        scratchpad: list[dict],
+    ) -> tuple[SentimentOutput, list[dict], list[str]]:
+        messages = list(scratchpad)
+        errors: list[str] = []
+        market_data = None
+        news_chunks: list[NewsChunk] = []
+        searches = 0
+        for iteration in range(1, self.max_agent_iterations + 1):
+            if market_data is None:
+                args = {"symbol": symbol}
+                market_data = self.mcp.call_tool("sentiment", "get_market_data", **args)
+                self._record_tool_interaction(request_id, "sentiment", "get_market_data", args, market_data)
+                messages.append({"role": "tool", "tool": "get_market_data", "iteration": iteration, "content": f"Loaded market data for {symbol}."})
+                continue
+            if searches == 0:
+                query = f"{symbol} Morocco"
+                args = {"query": query, "top_k": 5, "filters": None}
+                news_chunks = self.mcp.call_tool("sentiment", "search_news", **args)
+                searches += 1
+                self._record_tool_interaction(request_id, "sentiment", "search_news", args, [chunk.model_dump(mode="json") for chunk in news_chunks])
+                messages.append({"role": "assistant", "iteration": iteration, "content": f"Searching news with query: {query}"})
+                continue
+            high_confidence = [chunk for chunk in news_chunks if chunk.similarity_score >= 0.55]
+            if searches < 2 and len(high_confidence) < 2:
+                query = f"{symbol} corporate notice Morocco"
+                args = {"query": query, "top_k": 5, "filters": None}
+                news_chunks = self.mcp.call_tool("sentiment", "search_news", **args)
+                searches += 1
+                self._record_tool_interaction(request_id, "sentiment", "search_news", args, [chunk.model_dump(mode="json") for chunk in news_chunks])
+                messages.append({"role": "assistant", "iteration": iteration, "content": f"Retrying retrieval with query: {query}"})
+                continue
+            output = run_sentiment_agent(
+                symbol=symbol,
+                request_intent=request_intent,
+                market_data=market_data,
+                news_chunks=news_chunks,
+            )
+            messages.append({"role": "assistant", "iteration": iteration, "content": "Sentiment synthesis completed."})
+            return output, messages, errors
+        errors.append(f"Sentiment agent exceeded the {self.max_agent_iterations}-iteration cap.")
+        messages.append({"role": "system", "content": errors[-1]})
+        return self._safe_sentiment_output(symbol, "Le moteur a atteint la limite d'itérations."), messages, errors
+
+    def _run_technical_loop(
+        self,
+        *,
+        request_id: str,
+        symbol: str,
+        stock: StockInfo,
+        scratchpad: list[dict],
+        initial_retry_count: int = 0,
+    ) -> tuple[TechnicalOutput, dict[str, Any], int, list[dict], list[str]]:
+        messages = list(scratchpad)
+        errors: list[str] = []
+        fetched_market_data = None
+        technical_features = None
+        technical_output = None
+        retry_count = initial_retry_count
+        for iteration in range(1, self.max_agent_iterations + 1):
+            if fetched_market_data is None:
+                args = {"symbol": symbol}
+                fetched_market_data = self.mcp.call_tool("technical", "get_market_data", **args)
+                self._record_tool_interaction(request_id, "technical", "get_market_data", args, fetched_market_data)
+                messages.append({"role": "tool", "tool": "get_market_data", "iteration": iteration, "content": f"Fetched technical market context for {symbol}."})
+                continue
+            if technical_features is None:
+                args = {"symbol": symbol}
+                features = self.mcp.call_tool("technical", "analyze_technical", **args)
+                technical_features = features.model_dump(mode="json") if hasattr(features, "model_dump") else features
+                self._record_tool_interaction(request_id, "technical", "analyze_technical", args, technical_features)
+                technical_output, technical_features, retry_count, retry_errors = self._execute_technical_with_ground_truth(
+                    request_id=request_id,
+                    symbol=symbol,
+                    stock=stock,
+                    initial_retry_count=retry_count,
+                )
+                errors.extend(retry_errors)
+                messages.append({"role": "assistant", "iteration": iteration, "content": "Technical synthesis completed."})
+                return technical_output, technical_features, retry_count, messages, errors
+        errors.append(f"Technical agent exceeded the {self.max_agent_iterations}-iteration cap.")
+        messages.append({"role": "system", "content": errors[-1]})
+        technical_output, technical_features = run_technical_agent(stock, mismatch_feedback="Fallback after iteration cap.")
+        return technical_output, technical_features, retry_count, messages, errors
+
+    def _run_risk_loop(
+        self,
+        *,
+        request_id: str,
+        symbol: str,
+        capital: float,
+        request_intent: RequestIntent,
+        scratchpad: list[dict],
+    ) -> tuple[RiskOutput, list[dict], list[str]]:
+        messages = list(scratchpad)
+        errors: list[str] = []
+        sentiment_output = None
+        technical_output = None
+        sizing = None
+        for iteration in range(1, self.max_agent_iterations + 1):
+            if sentiment_output is None:
+                sentiment_output = self.mcp.call_tool("risk", "get_sentiment_output")
+                self._record_tool_interaction(request_id, "risk", "get_sentiment_output", {}, sentiment_output)
+                messages.append({"role": "tool", "tool": "get_sentiment_output", "iteration": iteration, "content": "Loaded upstream sentiment output."})
+                continue
+            if technical_output is None:
+                technical_output = self.mcp.call_tool("risk", "get_technical_output")
+                self._record_tool_interaction(request_id, "risk", "get_technical_output", {}, technical_output)
+                messages.append({"role": "tool", "tool": "get_technical_output", "iteration": iteration, "content": "Loaded upstream technical output."})
+                continue
+            sentiment_model = SentimentOutput.model_validate(sentiment_output)
+            technical_model = TechnicalOutput.model_validate(technical_output)
+            action = (
+                "BUY"
+                if technical_model.directional_bias == "BULLISH" and sentiment_model.sentiment_score >= 0.5
+                else "SELL"
+                if technical_model.directional_bias == "BEARISH" and sentiment_model.sentiment_score < 0.5
+                else "HOLD"
+            )
+            if sizing is None:
+                args = {"symbol": symbol, "action": action, "capital": capital}
+                sizing = self.mcp.call_tool("risk", "calculate_size", **args)
+                self._record_tool_interaction(request_id, "risk", "calculate_size", args, sizing)
+                messages.append({"role": "assistant", "iteration": iteration, "content": f"Calculated position sizing for action {action}."})
+                continue
+            output = run_risk_agent(
+                symbol=symbol,
+                capital=capital,
+                sentiment_output=sentiment_model,
+                technical_output=technical_model,
+                technical_features=self._active_state_context.get("technical_features") or {},
+                request_intent=request_intent,
+            )
+            messages.append({"role": "assistant", "iteration": iteration, "content": "Risk synthesis completed."})
+            return output, messages, errors
+        errors.append(f"Risk agent exceeded the {self.max_agent_iterations}-iteration cap.")
+        messages.append({"role": "system", "content": errors[-1]})
+        technical_model = TechnicalOutput.model_validate(self._active_state_context.get("technical_output"))
+        return self._safe_risk_output(request_intent, technical_model), messages, errors
+
+    def _run_coordinator_loop(
+        self,
+        *,
+        request_id: str,
+        symbol: str,
+        request_intent: RequestIntent,
+        scratchpad: list[dict],
+    ) -> tuple[CoordinatorOutput, list[dict], list[str]]:
+        messages = list(scratchpad)
+        errors: list[str] = []
+        aggregated = None
+        for iteration in range(1, self.max_agent_iterations + 1):
+            if aggregated is None:
+                aggregated = self.mcp.call_tool("coordinator", "get_all_outputs")
+                self._record_tool_interaction(request_id, "coordinator", "get_all_outputs", {}, aggregated)
+                messages.append({"role": "tool", "tool": "get_all_outputs", "iteration": iteration, "content": "Loaded all upstream outputs."})
+                continue
+            output = run_coordinator_agent(
+                symbol=symbol,
+                request_intent=request_intent,
+                sentiment_output=SentimentOutput.model_validate(aggregated["sentiment"]),
+                technical_output=TechnicalOutput.model_validate(aggregated["technical"]),
+                risk_output=RiskOutput.model_validate(aggregated["risk"]),
+            )
+            messages.append({"role": "assistant", "iteration": iteration, "content": "Coordinator synthesis completed."})
+            return output, messages, errors
+        errors.append(f"Coordinator agent exceeded the {self.max_agent_iterations}-iteration cap.")
+        messages.append({"role": "system", "content": errors[-1]})
+        return self._safe_coordinator_output(symbol, request_intent), messages, errors
+
     def _run_universe_scan(self, intent: RequestIntent) -> TradeOpportunityList:
         asyncio.run(self.ingest_news())
         stocks = asyncio.run(self.drahmi_client.list_stocks())
@@ -397,33 +639,40 @@ class TradingGraphService:
         asyncio.run(self.ingest_news(symbol))
         self.storage.add_event(intent.request_id, "agent_start", {"agent": "sentiment", "symbol": symbol})
         stock = asyncio.run(self.drahmi_client.get_stock(symbol))
-        news_chunks = self.retriever.search_news(f"{symbol} Morocco", top_k=5, filters=None)
-        sentiment_output = run_sentiment_agent(
+        sentiment_output, sentiment_messages, sentiment_errors = self._run_sentiment_loop(
+            request_id=intent.request_id,
             symbol=symbol,
             request_intent=intent,
-            market_data=stock,
-            news_chunks=news_chunks,
+            scratchpad=[],
         )
         self.storage.add_event(intent.request_id, "agent_complete", {"agent": "sentiment"})
 
         self.storage.add_event(intent.request_id, "agent_start", {"agent": "technical", "symbol": symbol})
-        technical_output, technical_features, technical_retry_count, technical_errors = self._execute_technical_with_ground_truth(
+        technical_output, technical_features, technical_retry_count, technical_messages, technical_errors = self._run_technical_loop(
             request_id=intent.request_id,
             symbol=symbol,
             stock=stock,
+            scratchpad=[],
         )
         self.storage.add_event(intent.request_id, "agent_complete", {"agent": "technical"})
 
+        self._active_state_context = {
+            "request_intent": intent,
+            "technical_features": technical_features,
+            "sentiment_output": sentiment_output,
+            "technical_output": technical_output,
+        }
+
         self.storage.add_event(intent.request_id, "agent_start", {"agent": "risk", "symbol": symbol})
-        risk_output = run_risk_agent(
+        risk_output, risk_messages, risk_errors = self._run_risk_loop(
+            request_id=intent.request_id,
             symbol=symbol,
             capital=intent.capital_mad,
-            sentiment_output=sentiment_output,
-            technical_output=technical_output,
-            technical_features=technical_features,
             request_intent=intent,
+            scratchpad=[],
         )
         self.storage.add_event(intent.request_id, "agent_complete", {"agent": "risk"})
+        self._active_state_context["risk_output"] = risk_output
         daily_limit = 0.06 if technical_features["is_fixing_mode"] else 0.10
         bias_delta = abs(
             sentiment_output.sentiment_score
@@ -442,12 +691,11 @@ class TradingGraphService:
         )
 
         self.storage.add_event(intent.request_id, "agent_start", {"agent": "coordinator", "symbol": symbol})
-        coordinator_output = run_coordinator_agent(
+        coordinator_output, coordinator_messages, coordinator_errors = self._run_coordinator_loop(
+            request_id=intent.request_id,
             symbol=symbol,
             request_intent=intent,
-            sentiment_output=sentiment_output,
-            technical_output=technical_output,
-            risk_output=risk_output,
+            scratchpad=[],
         )
         self.storage.add_event(intent.request_id, "agent_complete", {"agent": "coordinator"})
 
@@ -470,8 +718,12 @@ class TradingGraphService:
             "final_signal": final_signal,
             "technical_features": technical_features,
             "technical_retry_count": technical_retry_count,
+            "sentiment_messages": sentiment_messages,
+            "technical_messages": technical_messages,
+            "risk_messages": risk_messages,
+            "coordinator_messages": coordinator_messages,
             "human_review_required": human_review_required,
-            "errors": technical_errors,
+            "errors": [*sentiment_errors, *technical_errors, *risk_errors, *coordinator_errors],
         }
 
     def _graph_config(self, request_id: str) -> dict[str, Any]:
@@ -518,25 +770,28 @@ class TradingGraphService:
 
     def _sentiment_node(self, state: GraphState) -> dict[str, Any]:
         request_intent = RequestIntent.model_validate(state["request_intent"])
-        stock = StockInfo.model_validate(state["stock_info"])
-        news_chunks = [NewsChunk.model_validate(chunk) for chunk in state.get("news_chunks", [])]
         self.storage.add_event(state["request_id"], "agent_start", {"agent": "sentiment", "symbol": state["symbol"]})
-        sentiment_output = run_sentiment_agent(
+        sentiment_output, sentiment_messages, sentiment_errors = self._run_sentiment_loop(
+            request_id=state["request_id"],
             symbol=state["symbol"],
             request_intent=request_intent,
-            market_data=stock,
-            news_chunks=news_chunks,
+            scratchpad=state.get("sentiment_messages", []),
         )
         self.storage.add_event(state["request_id"], "agent_complete", {"agent": "sentiment"})
-        return {"sentiment_output": sentiment_output.model_dump(mode="json")}
+        return {
+            "sentiment_output": sentiment_output.model_dump(mode="json"),
+            "sentiment_messages": sentiment_messages,
+            "errors": [*state.get("errors", []), *sentiment_errors],
+        }
 
     def _technical_node(self, state: GraphState) -> dict[str, Any]:
         stock = StockInfo.model_validate(state["stock_info"])
         self.storage.add_event(state["request_id"], "agent_start", {"agent": "technical", "symbol": state["symbol"]})
-        technical_output, technical_features, technical_retry_count, technical_errors = self._execute_technical_with_ground_truth(
+        technical_output, technical_features, technical_retry_count, technical_messages, technical_errors = self._run_technical_loop(
             request_id=state["request_id"],
             symbol=state["symbol"],
             stock=stock,
+            scratchpad=state.get("technical_messages", []),
             initial_retry_count=state.get("technical_retry_count", 0),
         )
         self.storage.add_event(state["request_id"], "agent_complete", {"agent": "technical"})
@@ -544,6 +799,7 @@ class TradingGraphService:
             "technical_output": technical_output.model_dump(mode="json"),
             "technical_features": technical_features,
             "technical_retry_count": technical_retry_count,
+            "technical_messages": technical_messages,
             "errors": [*state.get("errors", []), *technical_errors],
         }
 
@@ -552,16 +808,22 @@ class TradingGraphService:
         sentiment_output = SentimentOutput.model_validate(state["sentiment_output"])
         technical_output = TechnicalOutput.model_validate(state["technical_output"])
         technical_features = state["technical_features"] or {}
+        self._active_state_context = {
+            "request_intent": request_intent,
+            "technical_features": technical_features,
+            "sentiment_output": sentiment_output,
+            "technical_output": technical_output,
+        }
         self.storage.add_event(state["request_id"], "agent_start", {"agent": "risk", "symbol": state["symbol"]})
-        risk_output = run_risk_agent(
+        risk_output, risk_messages, risk_errors = self._run_risk_loop(
+            request_id=state["request_id"],
             symbol=state["symbol"],
             capital=state["capital"],
-            sentiment_output=sentiment_output,
-            technical_output=technical_output,
-            technical_features=technical_features,
             request_intent=request_intent,
+            scratchpad=state.get("risk_messages", []),
         )
         self.storage.add_event(state["request_id"], "agent_complete", {"agent": "risk"})
+        self._active_state_context["risk_output"] = risk_output
         daily_limit = 0.06 if technical_features.get("is_fixing_mode") else 0.10
         bias_delta = abs(
             sentiment_output.sentiment_score
@@ -580,7 +842,9 @@ class TradingGraphService:
         )
         return {
             "risk_output": risk_output.model_dump(mode="json"),
+            "risk_messages": risk_messages,
             "human_review_required": human_review_required,
+            "errors": [*state.get("errors", []), *risk_errors],
         }
 
     def _risk_router(self, state: GraphState) -> str:
@@ -602,16 +866,26 @@ class TradingGraphService:
 
     def _coordinator_node(self, state: GraphState) -> dict[str, Any]:
         request_intent = RequestIntent.model_validate(state["request_intent"])
+        self._active_state_context = {
+            "request_intent": request_intent,
+            "technical_features": state.get("technical_features") or {},
+            "sentiment_output": SentimentOutput.model_validate(state["sentiment_output"]),
+            "technical_output": TechnicalOutput.model_validate(state["technical_output"]),
+            "risk_output": RiskOutput.model_validate(state["risk_output"]),
+        }
         self.storage.add_event(state["request_id"], "agent_start", {"agent": "coordinator", "symbol": state["symbol"]})
-        coordinator_output = run_coordinator_agent(
+        coordinator_output, coordinator_messages, coordinator_errors = self._run_coordinator_loop(
+            request_id=state["request_id"],
             symbol=state["symbol"],
             request_intent=request_intent,
-            sentiment_output=SentimentOutput.model_validate(state["sentiment_output"]),
-            technical_output=TechnicalOutput.model_validate(state["technical_output"]),
-            risk_output=RiskOutput.model_validate(state["risk_output"]),
+            scratchpad=state.get("coordinator_messages", []),
         )
         self.storage.add_event(state["request_id"], "agent_complete", {"agent": "coordinator"})
-        return {"coordinator_output": coordinator_output.model_dump(mode="json")}
+        return {
+            "coordinator_output": coordinator_output.model_dump(mode="json"),
+            "coordinator_messages": coordinator_messages,
+            "errors": [*state.get("errors", []), *coordinator_errors],
+        }
 
     def _enforce_limits_node(self, state: GraphState) -> dict[str, Any]:
         technical_features = state["technical_features"] or {}

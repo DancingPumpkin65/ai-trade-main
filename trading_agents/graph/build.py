@@ -781,7 +781,7 @@ class TradingGraphService:
         return {
             "sentiment_output": sentiment_output.model_dump(mode="json"),
             "sentiment_messages": sentiment_messages,
-            "errors": [*state.get("errors", []), *sentiment_errors],
+            "errors": sentiment_errors,
         }
 
     def _technical_node(self, state: GraphState) -> dict[str, Any]:
@@ -800,7 +800,7 @@ class TradingGraphService:
             "technical_features": technical_features,
             "technical_retry_count": technical_retry_count,
             "technical_messages": technical_messages,
-            "errors": [*state.get("errors", []), *technical_errors],
+            "errors": technical_errors,
         }
 
     def _risk_node(self, state: GraphState) -> dict[str, Any]:
@@ -844,7 +844,7 @@ class TradingGraphService:
             "risk_output": risk_output.model_dump(mode="json"),
             "risk_messages": risk_messages,
             "human_review_required": human_review_required,
-            "errors": [*state.get("errors", []), *risk_errors],
+            "errors": risk_errors,
         }
 
     def _risk_router(self, state: GraphState) -> str:
@@ -884,7 +884,7 @@ class TradingGraphService:
         return {
             "coordinator_output": coordinator_output.model_dump(mode="json"),
             "coordinator_messages": coordinator_messages,
-            "errors": [*state.get("errors", []), *coordinator_errors],
+            "errors": coordinator_errors,
         }
 
     def _enforce_limits_node(self, state: GraphState) -> dict[str, Any]:

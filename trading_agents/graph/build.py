@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from trading_agents.core.broker.alpaca import AlpacaPreviewService
+from trading_agents.core.data.bourse_fetcher import BourseDataFetcher
 from trading_agents.core.data.drahmi import DrahmiClient
 from trading_agents.core.data.news_global import MarketAuxClient
 from trading_agents.core.data.news_morocco import MoroccoNewsClient
@@ -69,6 +70,7 @@ class TradingGraphService:
         alpaca_preview_service: AlpacaPreviewService,
         checkpoint_path: Path | None = None,
         chroma_persist_dir: Path | None = None,
+        bourse_cache_dir: Path | None = None,
         env: str = "dev",
         max_agent_iterations: int = 8,
     ):
@@ -79,6 +81,7 @@ class TradingGraphService:
         self.alpaca_preview_service = alpaca_preview_service
         self.checkpoint_path = checkpoint_path
         self.chroma_persist_dir = chroma_persist_dir
+        self.bourse_cache_dir = bourse_cache_dir
         self.env = env
         self.max_agent_iterations = max_agent_iterations
         self.policy_engine = IntentPolicyEngine()
@@ -89,6 +92,8 @@ class TradingGraphService:
         )
         self.indexer = Indexer(self.vector_store)
         self.retriever = NewsRetriever(self.vector_store)
+        self.bourse_fetcher = BourseDataFetcher(bourse_cache_dir or Path("./data/bourse_pdfs"))
+        self._last_bourse_ingestion_date: date | None = None
         self.mcp = MCPServer()
         self._active_state_context: dict[str, Any] = {}
         self._register_tools()
@@ -219,11 +224,30 @@ class TradingGraphService:
         )
 
     async def ingest_news(self, symbol: str | None = None) -> None:
+        await self.ingest_bourse_documents()
         morocco_news = await self.morocco_news_client.fetch()
         self.indexer.upsert_news(morocco_news)
         if symbol:
             global_news = await self.marketaux_client.fetch_for_symbol(symbol)
             self.indexer.upsert_news(global_news)
+
+    async def ingest_bourse_documents(self) -> None:
+        today = datetime.now(timezone.utc).date()
+        if self.env == "test" or self._last_bourse_ingestion_date == today:
+            return
+        summary = await self.bourse_fetcher.run_daily()
+        chunks = summary.get("chunks", [])
+        if chunks:
+            self.indexer.upsert_macro_documents(chunks)
+            self.storage.add_event(
+                "system",
+                "bourse_ingestion",
+                {
+                    "indexed_chunks": summary.get("indexed_chunks", 0),
+                    "processed_files": summary.get("processed_files", 0),
+                },
+            )
+        self._last_bourse_ingestion_date = today
 
     def start(self, intent: RequestIntent) -> None:
         self.storage.update_request(intent.request_id, status=SignalStatus.RUNNING)

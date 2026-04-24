@@ -178,3 +178,44 @@ def test_technical_bias_mismatch_caps_and_force_corrects(tmp_path: Path, monkeyp
     assert saved_state["technical_retry_count"] == 2
     assert saved_state["technical_output"]["directional_bias"] == saved_state["technical_features"]["directional_bias"]
     assert saved_state["errors"]
+
+
+def test_agent_scratchpads_and_tool_events_are_recorded(tmp_path: Path, monkeypatch):
+    _configure_env(tmp_path, monkeypatch)
+    client = TestClient(app)
+    services = get_services()
+
+    response = client.post("/signals/generate", json={"prompt": "Analyze ATW with conservative risk"})
+    assert response.status_code == 200
+    request_id = response.json()["request_id"]
+
+    saved_state = services.storage.get_saved_state(request_id)
+    assert saved_state is not None
+    assert saved_state["sentiment_messages"]
+    assert saved_state["technical_messages"]
+    assert saved_state["risk_messages"]
+    assert saved_state["coordinator_messages"]
+
+    events = services.stream_events(request_id)
+    event_types = [event["event_type"] for event in events]
+    assert "tool_call" in event_types
+    assert "tool_result" in event_types
+
+
+def test_agent_iteration_cap_falls_back_safely(tmp_path: Path, monkeypatch):
+    _configure_env(tmp_path, monkeypatch)
+    client = TestClient(app)
+    services = get_services()
+    services.graph_service.max_agent_iterations = 1
+
+    response = client.post("/signals/generate", json={"prompt": "Analyze ATW"})
+    assert response.status_code == 200
+    request_id = response.json()["request_id"]
+
+    detail = client.get(f"/signals/{request_id}")
+    assert detail.status_code == 200
+    payload = detail.json()
+    saved_state = services.storage.get_saved_state(request_id)
+    assert saved_state is not None
+    assert any("iteration cap" in error.lower() for error in saved_state["errors"])
+    assert payload["final_signal"]["action"] == "HOLD"

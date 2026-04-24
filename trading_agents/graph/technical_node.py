@@ -4,17 +4,20 @@ from trading_agents.core.models import TechnicalOutput
 from trading_agents.graph.helpers import analyze_technical_features
 
 
-def run_technical_agent(stock_info) -> tuple[TechnicalOutput, dict]:
+def run_technical_agent(stock_info, mismatch_feedback: str | None = None) -> tuple[TechnicalOutput, dict]:
     features = analyze_technical_features(stock_info)
+    trend_summary = (
+        "Tendance haussière confirmée par EMA10 au-dessus de SMA20."
+        if features.directional_bias == "BULLISH"
+        else "Tendance baissière confirmée par EMA10 sous SMA20."
+        if features.directional_bias == "BEARISH"
+        else "Tendance neutre avec peu de différenciation entre EMA10 et SMA20."
+    )
+    if mismatch_feedback:
+        trend_summary = f"{trend_summary} Vérification supplémentaire: {mismatch_feedback}"
     output = TechnicalOutput(
         directional_bias=features.directional_bias,
-        trend_summary=(
-            "Tendance haussière confirmée par EMA10 au-dessus de SMA20."
-            if features.directional_bias == "BULLISH"
-            else "Tendance baissière confirmée par EMA10 sous SMA20."
-            if features.directional_bias == "BEARISH"
-            else "Tendance neutre avec peu de différenciation entre EMA10 et SMA20."
-        ),
+        trend_summary=trend_summary,
         momentum_summary=f"RSI14 à {features.rsi14:.2f}, lecture de momentum {'solide' if features.rsi14 > 55 else 'faible' if features.rsi14 < 45 else 'neutre'}.",
         volatility_summary=f"Volatilité annualisée estimée à {features.annualized_volatility:.2%}.",
         support_levels=features.support_levels,

@@ -307,6 +307,46 @@ class TradingGraphService:
         )
         self.storage.add_event(request_id, "pipeline_complete", {"symbol": final_signal.symbol})
 
+    def _execute_technical_with_ground_truth(self, *, request_id: str, symbol: str, stock: StockInfo, initial_retry_count: int = 0) -> tuple[TechnicalOutput, dict[str, Any], int, list[str]]:
+        retry_count = initial_retry_count
+        mismatch_feedback: str | None = None
+        errors: list[str] = []
+        while True:
+            technical_output, technical_features = run_technical_agent(stock, mismatch_feedback=mismatch_feedback)
+            ground_truth_bias = technical_features["directional_bias"]
+            if technical_output.directional_bias == ground_truth_bias:
+                return technical_output, technical_features, retry_count, errors
+
+            retry_count += 1
+            mismatch_message = (
+                f"Technical bias mismatch for {symbol}: model={technical_output.directional_bias}, "
+                f"ground_truth={ground_truth_bias}, retry={retry_count}."
+            )
+            errors.append(mismatch_message)
+            self.storage.add_event(
+                request_id,
+                "technical_retry",
+                {
+                    "symbol": symbol,
+                    "retry_count": retry_count,
+                    "model_bias": technical_output.directional_bias,
+                    "ground_truth_bias": ground_truth_bias,
+                },
+            )
+            if retry_count >= 2:
+                corrected_output = technical_output.model_copy(
+                    update={
+                        "directional_bias": ground_truth_bias,
+                        "trend_summary": f"{technical_output.trend_summary} Correction finale appliquée selon la vérité terrain Python.",
+                    }
+                )
+                return corrected_output, technical_features, retry_count, errors
+
+            mismatch_feedback = (
+                f"Votre biais précédent ({technical_output.directional_bias}) ne correspond pas à la vérité terrain "
+                f"calculée en Python ({ground_truth_bias}). Réévaluez uniquement la narration, pas les nombres."
+            )
+
     def _run_universe_scan(self, intent: RequestIntent) -> TradeOpportunityList:
         asyncio.run(self.ingest_news())
         stocks = asyncio.run(self.drahmi_client.list_stocks())
@@ -367,7 +407,11 @@ class TradingGraphService:
         self.storage.add_event(intent.request_id, "agent_complete", {"agent": "sentiment"})
 
         self.storage.add_event(intent.request_id, "agent_start", {"agent": "technical", "symbol": symbol})
-        technical_output, technical_features = run_technical_agent(stock)
+        technical_output, technical_features, technical_retry_count, technical_errors = self._execute_technical_with_ground_truth(
+            request_id=intent.request_id,
+            symbol=symbol,
+            stock=stock,
+        )
         self.storage.add_event(intent.request_id, "agent_complete", {"agent": "technical"})
 
         self.storage.add_event(intent.request_id, "agent_start", {"agent": "risk", "symbol": symbol})
@@ -425,8 +469,9 @@ class TradingGraphService:
             "coordinator_output": coordinator_output,
             "final_signal": final_signal,
             "technical_features": technical_features,
+            "technical_retry_count": technical_retry_count,
             "human_review_required": human_review_required,
-            "errors": [],
+            "errors": technical_errors,
         }
 
     def _graph_config(self, request_id: str) -> dict[str, Any]:
@@ -488,11 +533,18 @@ class TradingGraphService:
     def _technical_node(self, state: GraphState) -> dict[str, Any]:
         stock = StockInfo.model_validate(state["stock_info"])
         self.storage.add_event(state["request_id"], "agent_start", {"agent": "technical", "symbol": state["symbol"]})
-        technical_output, technical_features = run_technical_agent(stock)
+        technical_output, technical_features, technical_retry_count, technical_errors = self._execute_technical_with_ground_truth(
+            request_id=state["request_id"],
+            symbol=state["symbol"],
+            stock=stock,
+            initial_retry_count=state.get("technical_retry_count", 0),
+        )
         self.storage.add_event(state["request_id"], "agent_complete", {"agent": "technical"})
         return {
             "technical_output": technical_output.model_dump(mode="json"),
             "technical_features": technical_features,
+            "technical_retry_count": technical_retry_count,
+            "errors": [*state.get("errors", []), *technical_errors],
         }
 
     def _risk_node(self, state: GraphState) -> dict[str, Any]:

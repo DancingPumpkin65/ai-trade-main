@@ -661,29 +661,151 @@ class TradingGraphService:
         messages.append({"role": "system", "content": errors[-1]})
         return self._safe_coordinator_output(symbol, request_intent), messages, errors
 
+    def _chunk_matches_universe_symbol(self, chunk: NewsChunk, stock: StockInfo) -> bool:
+        symbol = stock.symbol.upper()
+        ticker = str(chunk.metadata.get("ticker", "")).upper()
+        tags = {str(tag).upper() for tag in chunk.metadata.get("tags", [])}
+        haystack = f"{chunk.text} {chunk.source} {chunk.metadata.get('issuer_name', '')} {chunk.metadata.get('title', '')}".upper()
+        normalized_name = stock.name.upper()
+        return bool(
+            ticker == symbol
+            or symbol in tags
+            or symbol in haystack
+            or normalized_name in haystack
+        )
+
+    def _universe_notice_count(self, chunks: list[NewsChunk]) -> int:
+        notice_doc_types = {
+            "corporate_notices",
+            "weekly_notices",
+            "monthly_notices",
+            "quarterly_notices",
+            "issuer_publication",
+        }
+        return sum(1 for chunk in chunks if chunk.metadata.get("doc_type") in notice_doc_types)
+
+    def _freshness_score(self, chunks: list[NewsChunk]) -> float:
+        now = datetime.now(timezone.utc)
+        score = 0.0
+        for chunk in chunks:
+            if chunk.published_at is None:
+                continue
+            age_days = max(0.0, (now - chunk.published_at).total_seconds() / 86400)
+            if age_days <= 3:
+                score += 1.0
+            elif age_days <= 7:
+                score += 0.6
+            elif age_days <= 14:
+                score += 0.25
+        return score
+
+    def _liquidity_score(self, stock: StockInfo, features) -> tuple[float, str]:
+        if stock.last_volume >= 1_000_000 and features.zero_volume_bar_count == 0:
+            return 0.25, "Liquidite solide"
+        if stock.last_volume >= 100_000 and features.zero_volume_bar_count <= 1:
+            return 0.15, "Liquidite correcte"
+        if stock.last_volume >= 25_000:
+            return 0.05, "Liquidite limitee"
+        return -0.2, "Liquidite insuffisante"
+
+    def _technical_strength_score(self, features, policy) -> tuple[float, list[str]]:
+        score = 0.0
+        reasons: list[str] = []
+        if features.directional_bias == "BULLISH":
+            score += 0.35 * policy.technical_weight
+            reasons.append("Biais technique haussier")
+        elif features.directional_bias == "NEUTRAL":
+            score += 0.1 * policy.technical_weight
+            reasons.append("Biais technique neutre")
+        if 48 <= features.rsi14 <= 68:
+            score += 0.08
+            reasons.append("Momentum exploitable")
+        if features.annualized_volatility <= 0.35 * max(policy.volatility_penalty, 0.1):
+            score += 0.12
+            reasons.append("Volatilite compatible")
+        elif features.annualized_volatility >= 0.75:
+            score -= 0.1
+            reasons.append("Volatilite elevee")
+        return score, reasons
+
+    def _rank_universe_candidate(self, intent: RequestIntent, stock: StockInfo, policy) -> tuple[RankedCandidate | None, str | None]:
+        features = analyze_technical_features(stock)
+        metadata = {
+            "request_id": intent.request_id,
+            "symbol": stock.symbol,
+            "query_source": "universe_scan",
+            "request_mode": intent.request_mode.value,
+            "time_horizon": intent.time_horizon.value,
+            "risk_preference": intent.risk_preference.value,
+        }
+        retrieved_chunks = self.retriever.search_news(
+            f"{stock.symbol} {stock.name} Morocco",
+            top_k=8,
+            filters=None,
+            metadata=metadata,
+        )
+        relevant_chunks = [chunk for chunk in retrieved_chunks if self._chunk_matches_universe_symbol(chunk, stock)]
+        notice_count = self._universe_notice_count(relevant_chunks)
+        freshness_score = self._freshness_score(relevant_chunks)
+        score = 0.0
+        reasons: list[str] = []
+
+        technical_score, technical_reasons = self._technical_strength_score(features, policy)
+        score += technical_score
+        reasons.extend(technical_reasons)
+
+        liquidity_score, liquidity_reason = self._liquidity_score(stock, features)
+        score += liquidity_score
+        reasons.append(liquidity_reason)
+
+        if relevant_chunks:
+            catalyst_score = min(0.3, freshness_score * 0.08 * policy.news_weight)
+            score += catalyst_score
+            reasons.append(f"{len(relevant_chunks)} catalyseur(s) retrouve(s)")
+        if notice_count:
+            score += min(0.22, notice_count * 0.08 * policy.news_weight)
+            reasons.append(f"{notice_count} avis/publication(s) emetteur")
+        if intent.time_horizon.value == "SHORT_TERM" and freshness_score > 0:
+            score += 0.08
+            reasons.append("Catalyseurs recents adaptes au court terme")
+
+        if stock.last_volume < 25_000 or features.zero_volume_bar_count >= 3:
+            return None, f"{stock.symbol}: liquidite trop faible pour un scan exploitable."
+        if score < 0.38:
+            return None, f"{stock.symbol}: score preliminaire insuffisant ({score:.2f})."
+        if not relevant_chunks and features.directional_bias != "BULLISH":
+            return None, f"{stock.symbol}: aucun catalyseur recent et biais technique non haussier."
+
+        return RankedCandidate(symbol=stock.symbol, score=round(score, 4), reasons=reasons), None
+
     def _run_universe_scan(self, intent: RequestIntent) -> TradeOpportunityList:
         asyncio.run(self.ingest_news())
         stocks = asyncio.run(self.drahmi_client.list_stocks())
         policy = self.policy_engine.build(intent)
         ranked: list[RankedCandidate] = []
+        rejected: list[str] = []
+        self._active_state_context = {
+            "request_id": intent.request_id,
+            "request_intent": intent,
+        }
         for stock in stocks:
-            features = analyze_technical_features(stock)
-            score = 0.0
-            reasons = []
-            if features.directional_bias == "BULLISH":
-                score += 0.5 * policy.technical_weight
-                reasons.append("Directional bias bullish")
-            if stock.last_volume > 0:
-                score += 0.2
-                reasons.append("Liquidity available")
-            score += max(0.0, 0.3 - features.annualized_volatility * 0.2 / max(policy.volatility_penalty, 0.1))
-            if intent.time_horizon.value == "SHORT_TERM":
-                score += 0.1
-            ranked.append(RankedCandidate(symbol=stock.symbol, score=round(score, 4), reasons=reasons))
+            candidate, rejection_reason = self._rank_universe_candidate(intent, stock, policy)
+            if candidate is not None:
+                ranked.append(candidate)
+            elif rejection_reason is not None:
+                rejected.append(rejection_reason)
         ranked.sort(key=lambda item: item.score, reverse=True)
         selected = ranked[:5]
+        if not selected:
+            return TradeOpportunityList(
+                request_id=intent.request_id,
+                capital_mad=intent.capital_mad,
+                time_horizon=intent.time_horizon,
+                risk_preference=intent.risk_preference,
+                top_opportunities=[],
+                rejected_candidates_summary=rejected or ["Aucune configuration exploitable cette semaine."],
+            )
         opportunities: list[TradeOpportunity] = []
-        rejected: list[str] = []
         for rank, candidate in enumerate(selected, start=1):
             result = self._run_symbol_legacy(intent, candidate.symbol)
             if result["final_signal"] is not None and result["final_signal"].action != "HOLD":
@@ -696,7 +818,9 @@ class TradingGraphService:
                     )
                 )
             else:
-                rejected.append(f"{candidate.symbol}: aucune configuration exploitable retenue.")
+                rejected.append(
+                    f"{candidate.symbol}: aucune configuration exploitable retenue apres evaluation detaillee."
+                )
         opportunities = opportunities[:3]
         return TradeOpportunityList(
             request_id=intent.request_id,

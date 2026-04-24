@@ -1,10 +1,11 @@
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from trading_agents.api.deps import get_services
 from trading_agents.api.main import app
-from trading_agents.core.models import StockInfo
+from trading_agents.core.models import GenerateSignalRequest, NewsChunk, StockInfo
 from trading_agents.graph import build as graph_build
 from trading_agents.graph.technical_node import run_technical_agent as actual_run_technical_agent
 
@@ -47,6 +48,41 @@ def _volatile_stock(symbol: str = "ATW") -> StockInfo:
         last_volume=history[-1]["volume"],
         high_52w=max(closes),
         low_52w=min(closes),
+        ohlcv=history,
+    )
+
+
+def _trend_stock(
+    symbol: str,
+    name: str,
+    *,
+    start_price: float = 100.0,
+    step: float = 1.2,
+    last_volume: float = 2_000_000.0,
+    bars: int = 30,
+) -> StockInfo:
+    history = []
+    for idx in range(bars):
+        close = start_price + step * idx
+        history.append(
+            {
+                "date": f"2026-02-{idx + 1:02d}",
+                "open": round(close * 0.995, 2),
+                "high": round(close * 1.01, 2),
+                "low": round(close * 0.99, 2),
+                "close": round(close, 2),
+                "volume": last_volume,
+            }
+        )
+    return StockInfo(
+        symbol=symbol,
+        name=name,
+        sector="Banks",
+        market_cap=50_000_000_000,
+        last_price=history[-1]["close"],
+        last_volume=last_volume,
+        high_52w=max(bar["close"] for bar in history),
+        low_52w=min(bar["close"] for bar in history),
         ohlcv=history,
     )
 
@@ -219,3 +255,91 @@ def test_agent_iteration_cap_falls_back_safely(tmp_path: Path, monkeypatch):
     assert saved_state is not None
     assert any("iteration cap" in error.lower() for error in saved_state["errors"])
     assert payload["final_signal"]["action"] == "HOLD"
+
+
+def test_universe_scan_ranking_prefers_fresh_notice_candidate(tmp_path: Path, monkeypatch):
+    _configure_env(tmp_path, monkeypatch)
+    services = get_services()
+    intent = services.intent_parser.parse(
+        GenerateSignalRequest(prompt="I have 100,000 MAD. What are the best possible trades this week?")
+    )
+    policy = services.graph_service.policy_engine.build(intent)
+    now = datetime.now(timezone.utc)
+    atw = _trend_stock("ATW", "Attijariwafa Bank", last_volume=2_500_000.0, step=1.8)
+    iam = _trend_stock("IAM", "Maroc Telecom", last_volume=300_000.0, step=0.4)
+
+    def fake_search_news(query, top_k=8, filters=None, metadata=None):
+        if "ATW" in query:
+            return [
+                NewsChunk(
+                    chunk_id="issuer-atw",
+                    text="Attijariwafa Bank annonce un dividende 2025 et une convocation AGO.",
+                    source="Casablanca Bourse Issuer Publication",
+                    published_at=now - timedelta(days=1),
+                    similarity_score=0.95,
+                    url="https://example.com/atw.pdf",
+                    metadata={"doc_type": "issuer_publication", "ticker": "ATW"},
+                ),
+                NewsChunk(
+                    chunk_id="notice-atw",
+                    text="ATW avis de mise en paiement du dividende.",
+                    source="Casablanca Bourse PDF",
+                    published_at=now - timedelta(days=2),
+                    similarity_score=0.9,
+                    url="https://example.com/atw-notice.pdf",
+                    metadata={"doc_type": "corporate_notices", "ticker": "ATW"},
+                ),
+            ]
+        return [
+            NewsChunk(
+                chunk_id="news-iam",
+                text="Maroc Telecom information generale plus ancienne.",
+                source="Sample Feed",
+                published_at=now - timedelta(days=18),
+                similarity_score=0.6,
+                url="https://example.com/iam",
+                metadata={"doc_type": "news", "ticker": "IAM"},
+            )
+        ]
+
+    services.graph_service.retriever.search_news = fake_search_news
+    atw_candidate, atw_rejection = services.graph_service._rank_universe_candidate(intent, atw, policy)
+    iam_candidate, iam_rejection = services.graph_service._rank_universe_candidate(intent, iam, policy)
+
+    assert atw_rejection is None
+    assert atw_candidate is not None
+    assert iam_candidate is None or atw_candidate.score > iam_candidate.score
+    assert any("avis/publication" in reason.lower() for reason in atw_candidate.reasons)
+
+
+def test_universe_scan_threshold_rejects_weak_candidates_before_deep_eval(tmp_path: Path, monkeypatch):
+    _configure_env(tmp_path, monkeypatch)
+    services = get_services()
+    intent = services.intent_parser.parse(
+        GenerateSignalRequest(prompt="What are the best possible trades this week?", capital=100000)
+    )
+
+    async def fake_ingest_news(symbol=None):
+        return None
+
+    async def fake_list_stocks():
+        return [
+            _trend_stock("WEAK1", "Weak One", last_volume=1000.0, step=-0.2),
+            _trend_stock("WEAK2", "Weak Two", last_volume=500.0, step=-0.1),
+        ]
+
+    def fake_search_news(query, top_k=8, filters=None, metadata=None):
+        return []
+
+    def should_not_run_symbol(*args, **kwargs):
+        raise AssertionError("Detailed symbol evaluation should not run for rejected candidates.")
+
+    services.graph_service.ingest_news = fake_ingest_news
+    services.graph_service.drahmi_client.list_stocks = fake_list_stocks
+    services.graph_service.retriever.search_news = fake_search_news
+    services.graph_service._run_symbol_legacy = should_not_run_symbol
+
+    result = services.graph_service._run_universe_scan(intent)
+    assert result.top_opportunities == []
+    assert result.rejected_candidates_summary
+    assert any("insuffisant" in item.lower() or "liquidite" in item.lower() for item in result.rejected_candidates_summary)

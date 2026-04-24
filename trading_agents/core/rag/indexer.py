@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 from trading_agents.core.models import NewsChunk
-from trading_agents.core.rag.store import InMemoryVectorStore
+from trading_agents.core.rag.store import BaseVectorStore
 
 
 BLOCKED_DOMAINS = {"finance.yahoo.com", "nasdaq.com", "seekingalpha.com", "etfdailynews.com", "marketscreener.com"}
 
 
 class Indexer:
-    def __init__(self, store: InMemoryVectorStore):
+    def __init__(self, store: BaseVectorStore):
         self.store = store
 
     def upsert_news(self, chunks: list[NewsChunk]) -> int:

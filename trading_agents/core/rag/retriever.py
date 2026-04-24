@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from trading_agents.core.models import NewsChunk
-from trading_agents.core.rag.store import InMemoryVectorStore
+from trading_agents.core.rag.store import BaseVectorStore
 
 
 class NewsRetriever:
-    def __init__(self, store: InMemoryVectorStore):
+    def __init__(self, store: BaseVectorStore):
         self.store = store
 
     def search_news(self, query: str, top_k: int = 5, filters: dict | None = None) -> list[NewsChunk]:

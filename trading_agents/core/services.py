@@ -60,6 +60,8 @@ class AppServices:
             marketaux_client=self.marketaux_client,
             alpaca_preview_service=self.alpaca_preview_service,
             checkpoint_path=settings.langgraph_checkpoint_path,
+            chroma_persist_dir=settings.chroma_persist_dir,
+            env=settings.env,
         )
         self.auth_service = AuthService(self.storage, settings.secret_key)
 
@@ -74,6 +76,7 @@ class AppServices:
             "langsmith_tracing": self.settings.langsmith_tracing,
             "alpaca_enabled": self.settings.alpaca_enabled,
             "langgraph_enabled": self.graph_service.langgraph_enabled,
+            "rag_backend": self.graph_service.vector_store.backend_name,
         }
 
     def generate(self, payload: GenerateSignalRequest) -> GenerateSignalResponse:

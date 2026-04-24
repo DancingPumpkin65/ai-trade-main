@@ -63,6 +63,8 @@ class AppServices:
             chroma_persist_dir=settings.chroma_persist_dir,
             bourse_cache_dir=settings.data_dir / "bourse_pdfs",
             env=settings.env,
+            langsmith_tracing=settings.langsmith_tracing,
+            langsmith_project=settings.langsmith_project,
         )
         self.auth_service = AuthService(self.storage, settings.secret_key)
 

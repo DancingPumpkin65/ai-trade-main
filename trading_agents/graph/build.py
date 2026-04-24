@@ -28,6 +28,7 @@ from trading_agents.core.models import (
     TradeOpportunityList,
     TradingSignal,
 )
+from trading_agents.core.observability import LangSmithRetrievalTracer
 from trading_agents.core.rag.indexer import Indexer
 from trading_agents.core.rag.retriever import NewsRetriever
 from trading_agents.core.rag.store import build_vector_store
@@ -72,6 +73,8 @@ class TradingGraphService:
         chroma_persist_dir: Path | None = None,
         bourse_cache_dir: Path | None = None,
         env: str = "dev",
+        langsmith_tracing: bool = False,
+        langsmith_project: str = "morocco-trading-agents",
         max_agent_iterations: int = 8,
     ):
         self.storage = storage
@@ -85,13 +88,17 @@ class TradingGraphService:
         self.env = env
         self.max_agent_iterations = max_agent_iterations
         self.policy_engine = IntentPolicyEngine()
+        self.retrieval_tracer = LangSmithRetrievalTracer(
+            enabled=langsmith_tracing,
+            project_name=langsmith_project,
+        )
         self.vector_store = build_vector_store(
             persist_dir=chroma_persist_dir or Path("./data/chroma"),
             env=env,
             prefer_chroma=True,
         )
         self.indexer = Indexer(self.vector_store)
-        self.retriever = NewsRetriever(self.vector_store)
+        self.retriever = NewsRetriever(self.vector_store, tracer=self.retrieval_tracer)
         self.bourse_fetcher = BourseDataFetcher(bourse_cache_dir or Path("./data/bourse_pdfs"))
         self._last_bourse_ingestion_date: date | None = None
         self._issuer_ingestion_cache: set[tuple[date, str]] = set()
@@ -155,7 +162,7 @@ class TradingGraphService:
         return builder.compile(checkpointer=self.checkpointer, name="morocco-trading-single-symbol")
 
     def _register_tools(self) -> None:
-        self.mcp.register_tool("sentiment", "search_news", lambda query, top_k=5, filters=None: self.retriever.search_news(query, top_k, filters))
+        self.mcp.register_tool("sentiment", "search_news", lambda query, top_k=5, filters=None: self.retriever.search_news(query, top_k, filters, metadata=self._retrieval_metadata(query_source="sentiment_tool", top_k=top_k)))
         self.mcp.register_tool("sentiment", "get_market_data", lambda symbol: asyncio.run(self.drahmi_client.get_stock(symbol)))
         self.mcp.register_tool("technical", "get_market_data", lambda symbol: asyncio.run(self.drahmi_client.get_stock(symbol)))
         self.mcp.register_tool("technical", "analyze_technical", lambda symbol: analyze_technical_features(asyncio.run(self.drahmi_client.get_stock(symbol))))
@@ -190,6 +197,18 @@ class TradingGraphService:
         self.storage.add_event(request_id, "tool_call", {"agent": agent, "tool": tool_name, "args": args})
         payload = result.model_dump(mode="json") if hasattr(result, "model_dump") else result
         self.storage.add_event(request_id, "tool_result", {"agent": agent, "tool": tool_name, "result": payload})
+
+    def _retrieval_metadata(self, *, query_source: str, top_k: int) -> dict[str, Any]:
+        request_intent = self._active_state_context.get("request_intent")
+        return {
+            "request_id": self._active_state_context.get("request_id"),
+            "symbol": self._active_state_context.get("symbol"),
+            "query_source": query_source,
+            "top_k": top_k,
+            "request_mode": request_intent.request_mode.value if request_intent else None,
+            "time_horizon": request_intent.time_horizon.value if request_intent else None,
+            "risk_preference": request_intent.risk_preference.value if request_intent else None,
+        }
 
     def _safe_sentiment_output(self, symbol: str, note: str) -> SentimentOutput:
         return SentimentOutput(
@@ -710,6 +729,8 @@ class TradingGraphService:
         self.storage.add_event(intent.request_id, "agent_complete", {"agent": "technical"})
 
         self._active_state_context = {
+            "request_id": intent.request_id,
+            "symbol": symbol,
             "request_intent": intent,
             "technical_features": technical_features,
             "sentiment_output": sentiment_output,
@@ -812,9 +833,20 @@ class TradingGraphService:
 
     def _prepare_context_node(self, state: GraphState) -> dict[str, Any]:
         symbol = state["symbol"]
+        request_intent = RequestIntent.model_validate(state["request_intent"])
+        self._active_state_context = {
+            "request_id": state["request_id"],
+            "symbol": symbol,
+            "request_intent": request_intent,
+        }
         asyncio.run(self.ingest_news(symbol))
         stock = asyncio.run(self.drahmi_client.get_stock(symbol))
-        news_chunks = self.retriever.search_news(f"{symbol} Morocco", top_k=5, filters=None)
+        news_chunks = self.retriever.search_news(
+            f"{symbol} Morocco",
+            top_k=5,
+            filters=None,
+            metadata=self._retrieval_metadata(query_source="prepare_context", top_k=5),
+        )
         return {
             "selected_symbol": symbol,
             "stock_info": stock.model_dump(mode="json"),
@@ -862,6 +894,8 @@ class TradingGraphService:
         technical_output = TechnicalOutput.model_validate(state["technical_output"])
         technical_features = state["technical_features"] or {}
         self._active_state_context = {
+            "request_id": state["request_id"],
+            "symbol": state["symbol"],
             "request_intent": request_intent,
             "technical_features": technical_features,
             "sentiment_output": sentiment_output,
@@ -920,6 +954,8 @@ class TradingGraphService:
     def _coordinator_node(self, state: GraphState) -> dict[str, Any]:
         request_intent = RequestIntent.model_validate(state["request_intent"])
         self._active_state_context = {
+            "request_id": state["request_id"],
+            "symbol": state["symbol"],
             "request_intent": request_intent,
             "technical_features": state.get("technical_features") or {},
             "sentiment_output": SentimentOutput.model_validate(state["sentiment_output"]),

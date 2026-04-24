@@ -28,6 +28,7 @@ dev = [
 ]
 integrations = [
   "langgraph>=0.2.50",
+  "langgraph-checkpoint-sqlite>=3.0.0",
   "langchain-core>=0.3.0",
   "langsmith>=0.1.140",
   "chromadb>=0.5.5",

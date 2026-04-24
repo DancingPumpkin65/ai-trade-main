@@ -5,9 +5,11 @@ from typing import Literal, TypedDict
 
 from trading_agents.core.models import (
     CoordinatorOutput,
+    NewsChunk,
     RequestIntent,
     RiskOutput,
     SentimentOutput,
+    StockInfo,
     TechnicalOutput,
     TradingSignal,
 )
@@ -21,6 +23,9 @@ class GraphState(TypedDict):
     candidate_symbols: list[str]
     selected_symbol: str | None
     intent_warnings: list[str]
+    stock_info: StockInfo | None
+    news_chunks: list[NewsChunk]
+    technical_features: dict | None
     sentiment_output: SentimentOutput | None
     technical_output: TechnicalOutput | None
     risk_output: RiskOutput | None

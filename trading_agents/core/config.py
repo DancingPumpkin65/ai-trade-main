@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     ollama_model: str = Field(default="qwen2.5:7b-instruct", alias="OLLAMA_MODEL")
 
     chroma_persist_dir: Path = Field(default=Path("./data/chroma"), alias="CHROMA_PERSIST_DIR")
+    langgraph_checkpoint_path: Path = Field(
+        default=Path("./data/langgraph-checkpoints.sqlite"),
+        alias="LANGGRAPH_CHECKPOINT_PATH",
+    )
 
     langsmith_tracing: bool = Field(default=False, alias="LANGSMITH_TRACING")
     langsmith_api_key: str | None = Field(default=None, alias="LANGSMITH_API_KEY")
@@ -47,4 +51,5 @@ def get_settings() -> Settings:
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.chroma_persist_dir.mkdir(parents=True, exist_ok=True)
     settings.db_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.langgraph_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     return settings

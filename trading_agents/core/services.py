@@ -10,8 +10,10 @@ from trading_agents.core.config import Settings
 from trading_agents.core.data.drahmi import DrahmiClient
 from trading_agents.core.data.news_global import MarketAuxClient
 from trading_agents.core.data.news_morocco import MoroccoNewsClient
+from trading_agents.core.intent.normalizer import OllamaIntentNormalizer
 from trading_agents.core.intent.parser import IntentParser
 from trading_agents.core.models import GenerateSignalRequest, GenerateSignalResponse, SignalRecord, SignalStatus
+from trading_agents.core.observability import LangSmithIntentTracer
 from trading_agents.core.storage import Storage
 from trading_agents.graph.build import TradingGraphService
 
@@ -48,7 +50,17 @@ class AppServices:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.storage = Storage(settings.db_path)
-        self.intent_parser = IntentParser()
+        intent_tracer = LangSmithIntentTracer(
+            enabled=settings.langsmith_tracing,
+            project_name=settings.langsmith_project,
+        )
+        self.intent_parser = IntentParser(
+            normalizer=OllamaIntentNormalizer(
+                base_url=settings.ollama_base_url,
+                model=settings.ollama_model,
+            ),
+            tracer=intent_tracer,
+        )
         self.alpaca_preview_service = AlpacaPreviewService(enabled=settings.alpaca_enabled)
         self.drahmi_client = DrahmiClient(settings.drahmi_base_url, settings.drahmi_api_key, settings.drahmi_daily_limit)
         self.morocco_news_client = MoroccoNewsClient()
@@ -97,6 +109,8 @@ class AppServices:
                 "risk_preference": intent.risk_preference.value,
                 "time_horizon": intent.time_horizon.value,
                 "bias_override_refused": intent.bias_override_refused,
+                "parser_confidence": intent.parser_confidence,
+                "extraction_method": intent.extraction_method,
             },
         )
         self.graph_service.start(intent)

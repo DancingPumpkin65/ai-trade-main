@@ -72,3 +72,38 @@ class LangSmithRetrievalTracer:
         if hasattr(value, "model_dump"):
             return self._clean_value(value.model_dump(mode="json"))
         return str(value)
+
+
+class LangSmithIntentTracer:
+    def __init__(self, *, enabled: bool, project_name: str):
+        self.enabled = enabled and LANGSMITH_TRACE_AVAILABLE
+        self.project_name = project_name
+
+    def log_normalization(
+        self,
+        *,
+        prompt: str,
+        deterministic: dict[str, Any],
+        normalized: dict[str, Any] | None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if not self.enabled or trace is None:
+            return
+        clean_metadata = LangSmithRetrievalTracer._clean_value(self, metadata or {})
+        with trace(
+            "intent_normalization",
+            run_type="chain",
+            project_name=self.project_name,
+            inputs={
+                "prompt": prompt,
+                "deterministic": LangSmithRetrievalTracer._clean_value(self, deterministic),
+            },
+            metadata=clean_metadata,
+            tags=["intent", "normalization", "morocco-trading-agents"],
+        ) as run_tree:
+            run_tree.end(
+                outputs={
+                    "normalized": LangSmithRetrievalTracer._clean_value(self, normalized),
+                    "used_llm_fallback": normalized is not None,
+                }
+            )

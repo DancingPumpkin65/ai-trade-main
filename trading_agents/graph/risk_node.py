@@ -37,6 +37,7 @@ def run_risk_agent(
         capital=capital,
         volatility_estimate=technical_output.volatility_estimate,
         is_fixing_mode=bool(technical_features.get("is_fixing_mode")),
+        market_mode=technical_features.get("market_mode"),
         conservative_posture=conservative_posture,
     )
     if action == "HOLD":

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from math import sqrt
 
-from trading_agents.core.models import PositionSizing, StockInfo, TechnicalFeatures
+from trading_agents.core.models import MarketMode, PositionSizing, StockInfo, TechnicalFeatures
 
 
 def _ema(values: list[float], period: int) -> float:
@@ -11,6 +11,56 @@ def _ema(values: list[float], period: int) -> float:
     for value in values[1:]:
         ema = (value - ema) * multiplier + ema
     return ema
+
+
+def detect_market_mode(stock: StockInfo) -> MarketMode:
+    if stock.market_mode != MarketMode.UNKNOWN:
+        return stock.market_mode
+    haystack = " ".join(
+        [
+            stock.name,
+            stock.sector,
+            str(stock.market_metadata.get("market_mode", "")),
+            str(stock.market_metadata.get("trading_mode", "")),
+            str(stock.market_metadata.get("quote_mode", "")),
+            str(stock.market_metadata.get("instrument_type", "")),
+            str(stock.market_metadata.get("asset_type", "")),
+            str(stock.market_metadata.get("compartment", "")),
+        ]
+    ).lower()
+    if any(token in haystack for token in ("bond", "obligation", "fixed income", "treasury", "debt")):
+        return MarketMode.BOND
+    if any(token in haystack for token in ("fixing", "fixe")):
+        return MarketMode.FIXING
+    if any(token in haystack for token in ("continuous", "continu")):
+        return MarketMode.CONTINUOUS
+    if stock.last_price < 80 and stock.last_volume < 250_000:
+        return MarketMode.FIXING
+    return MarketMode.CONTINUOUS
+
+
+def normalize_market_mode(mode: MarketMode | str | None) -> MarketMode:
+    if isinstance(mode, MarketMode):
+        return mode
+    if isinstance(mode, str):
+        try:
+            return MarketMode(mode)
+        except ValueError:
+            return MarketMode.UNKNOWN
+    return MarketMode.UNKNOWN
+
+
+def is_fixing_market(mode: MarketMode | str | None) -> bool:
+    return normalize_market_mode(mode) == MarketMode.FIXING
+
+
+def market_mode_daily_limit(mode: MarketMode | str | None) -> float:
+    resolved = normalize_market_mode(mode)
+    if resolved == MarketMode.BOND:
+        return 0.02
+    if resolved == MarketMode.FIXING:
+        return 0.06
+    return 0.10
 
 
 def analyze_technical_features(stock: StockInfo) -> TechnicalFeatures:
@@ -54,6 +104,7 @@ def analyze_technical_features(stock: StockInfo) -> TechnicalFeatures:
     support_levels = sorted({round(value, 2) for value in lows[-5:]})[:3]
     resistance_levels = sorted({round(value, 2) for value in highs[-5:]}, reverse=True)[:3]
     directional_bias = "BULLISH" if ema10 > sma20 else "BEARISH" if ema10 < sma20 else "NEUTRAL"
+    market_mode = detect_market_mode(stock)
 
     return TechnicalFeatures(
         sma20=round(sma20, 4),
@@ -68,7 +119,8 @@ def analyze_technical_features(stock: StockInfo) -> TechnicalFeatures:
         directional_bias=directional_bias,
         annualized_volatility=round(abs(vol), 4),
         zero_volume_bar_count=sum(1 for volume in volumes if volume == 0),
-        is_fixing_mode=stock.last_price < 80,
+        market_mode=market_mode,
+        is_fixing_mode=is_fixing_market(market_mode),
     )
 
 
@@ -78,9 +130,11 @@ def calculate_position_size(
     capital: float,
     volatility_estimate: float,
     is_fixing_mode: bool,
+    market_mode: MarketMode = MarketMode.UNKNOWN,
     conservative_posture: bool = False,
 ) -> PositionSizing:
-    daily_limit = 0.06 if is_fixing_mode else 0.10
+    resolved_market_mode = MarketMode.FIXING if is_fixing_mode else normalize_market_mode(market_mode)
+    daily_limit = market_mode_daily_limit(resolved_market_mode)
     base_size = 0.03 if conservative_posture else 0.05
     position_size_pct = min(base_size, max(0.01, 0.05 - volatility_estimate * 0.03))
     if is_fixing_mode:
@@ -95,5 +149,6 @@ def calculate_position_size(
         take_profit_pct=round(max(take_profit_pct, stop_loss_pct * 1.5), 4),
         risk_score=round(risk_score, 4),
         volatility_estimate=round(volatility_estimate, 4),
+        market_mode=resolved_market_mode,
         is_fixing_mode=is_fixing_mode,
     )

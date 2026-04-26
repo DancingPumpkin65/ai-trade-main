@@ -2,15 +2,26 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from trading_agents.core.models import CoordinatorOutput, TradingSignal
+from trading_agents.core.models import CoordinatorOutput, MarketMode, TradingSignal
+from trading_agents.graph.helpers import is_fixing_market, market_mode_daily_limit, normalize_market_mode
 
 
-def enforce_limits(*, symbol: str, request_id: str, coordinator_output: CoordinatorOutput, is_fixing_mode: bool, capital: float) -> TradingSignal:
-    daily_limit = 0.06 if is_fixing_mode else 0.10
+def enforce_limits(
+    *,
+    symbol: str,
+    request_id: str,
+    coordinator_output: CoordinatorOutput,
+    is_fixing_mode: bool,
+    capital: float,
+    market_mode: MarketMode = MarketMode.UNKNOWN,
+) -> TradingSignal:
+    resolved_market_mode = MarketMode.FIXING if is_fixing_mode else normalize_market_mode(market_mode)
+    daily_limit = market_mode_daily_limit(resolved_market_mode)
+    resolved_is_fixing_mode = is_fixing_market(resolved_market_mode)
     stop_loss_pct = min(coordinator_output.stop_loss_pct, daily_limit)
     take_profit_pct = max(coordinator_output.take_profit_pct, stop_loss_pct * 1.5)
     position_size_pct = min(coordinator_output.position_size_pct, 0.05)
-    if is_fixing_mode:
+    if resolved_is_fixing_mode:
         position_size_pct *= 0.8
     position_value_mad = round(capital * position_size_pct, 2)
     gap_warning = None
@@ -27,7 +38,8 @@ def enforce_limits(*, symbol: str, request_id: str, coordinator_output: Coordina
         gap_risk_warning=gap_warning,
         rationale_fr=coordinator_output.rationale_fr,
         confidence=coordinator_output.confidence,
-        is_fixing_mode=is_fixing_mode,
+        market_mode=resolved_market_mode,
+        is_fixing_mode=resolved_is_fixing_mode,
         request_id=request_id,
         generated_at=datetime.now(timezone.utc),
     )

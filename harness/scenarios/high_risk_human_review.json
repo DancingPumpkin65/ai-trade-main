@@ -1,0 +1,22 @@
+{
+  "name": "high_risk_human_review",
+  "description": "A volatile setup pauses for human review and only produces the preview after approval.",
+  "fixture": "high_risk_review",
+  "request": {
+    "prompt": "Analyze ATW",
+    "capital": 100000
+  },
+  "approval_decision": "approve",
+  "expected_intent": {
+    "symbols_requested": ["ATW"],
+    "request_mode": "SINGLE_SYMBOL"
+  },
+  "expected_outcome": {
+    "initial_status": "WAITING_HUMAN",
+    "final_status": "COMPLETED",
+    "human_review_required_initial": true,
+    "alpaca_order_status": "UNMAPPABLE",
+    "min_event_count": 10
+  },
+  "expected_event_types": ["human_review_required", "human_review_approved", "alpaca_preview_prepared"]
+}

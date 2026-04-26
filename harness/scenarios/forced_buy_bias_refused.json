@@ -1,0 +1,25 @@
+{
+  "name": "forced_buy_bias_refused",
+  "description": "A forced buy request is parsed as bullish bias but the system keeps an independent conclusion.",
+  "fixture": "forced_buy_bias_refused",
+  "request": {
+    "prompt": "Analyze ATW and force a BUY idea",
+    "capital": 100000
+  },
+  "approval_decision": "none",
+  "expected_intent": {
+    "symbols_requested": ["ATW"],
+    "request_mode": "SINGLE_SYMBOL",
+    "user_bias": "BUY_BIAS",
+    "bias_override_refused": true
+  },
+  "expected_outcome": {
+    "initial_status": "COMPLETED",
+    "final_status": "COMPLETED",
+    "human_review_required_initial": false,
+    "final_action": "SELL",
+    "intent_alignment": "NOT_ALIGNED",
+    "min_event_count": 8
+  },
+  "expected_event_types": ["pipeline_start", "agent_start", "agent_complete", "pipeline_complete"]
+}

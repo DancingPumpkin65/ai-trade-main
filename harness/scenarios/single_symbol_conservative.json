@@ -1,0 +1,24 @@
+{
+  "name": "single_symbol_conservative",
+  "description": "A conservative single-symbol prompt yields a bounded trade with the parsed risk posture preserved.",
+  "fixture": "single_symbol_conservative",
+  "request": {
+    "prompt": "Analyze ATW with conservative risk",
+    "capital": 100000
+  },
+  "approval_decision": "none",
+  "expected_intent": {
+    "symbols_requested": ["ATW"],
+    "request_mode": "SINGLE_SYMBOL",
+    "risk_preference": "CONSERVATIVE"
+  },
+  "expected_outcome": {
+    "initial_status": "COMPLETED",
+    "final_status": "COMPLETED",
+    "human_review_required_initial": false,
+    "final_action": "BUY",
+    "intent_alignment": "PARTIALLY_ALIGNED",
+    "min_event_count": 8
+  },
+  "expected_event_types": ["pipeline_start", "agent_start", "agent_complete", "pipeline_complete"]
+}

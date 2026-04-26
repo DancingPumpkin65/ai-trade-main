@@ -1,0 +1,21 @@
+{
+  "name": "universe_scan_weekly",
+  "description": "A weekly best-trades prompt runs the universe scan and ranks ATW among the retained opportunities.",
+  "fixture": "universe_scan_weekly",
+  "request": {
+    "prompt": "I have 100,000 MAD. What are the best possible trades this week?"
+  },
+  "approval_decision": "none",
+  "expected_intent": {
+    "request_mode": "UNIVERSE_SCAN",
+    "time_horizon": "SHORT_TERM"
+  },
+  "expected_outcome": {
+    "initial_status": "COMPLETED",
+    "final_status": "COMPLETED",
+    "opportunity_count": 1,
+    "top_symbols": ["ATW"],
+    "min_event_count": 2
+  },
+  "expected_event_types": ["pipeline_start", "pipeline_complete"]
+}

@@ -45,12 +45,11 @@ from trading_agents.graph.technical_node import run_technical_agent
 try:
     from langgraph.graph import END, START, StateGraph
     from langgraph.checkpoint.memory import InMemorySaver
-    from langgraph.types import Command, interrupt
 
     LANGGRAPH_AVAILABLE = True
 except ImportError:  # pragma: no cover - exercised only when integrations are missing
     LANGGRAPH_AVAILABLE = False
-    END = START = StateGraph = InMemorySaver = Command = interrupt = None
+    END = START = StateGraph = InMemorySaver = None
 
 try:
     from langgraph.checkpoint.sqlite import SqliteSaver
@@ -70,6 +69,8 @@ class TradingGraphService:
         morocco_news_client: MoroccoNewsClient,
         marketaux_client: MarketAuxClient,
         alpaca_preview_service: AlpacaPreviewService,
+        alpaca_require_order_approval: bool = True,
+        alpaca_submit_orders: bool = False,
         checkpoint_path: Path | None = None,
         chroma_persist_dir: Path | None = None,
         bourse_cache_dir: Path | None = None,
@@ -83,6 +84,8 @@ class TradingGraphService:
         self.morocco_news_client = morocco_news_client
         self.marketaux_client = marketaux_client
         self.alpaca_preview_service = alpaca_preview_service
+        self.alpaca_require_order_approval = alpaca_require_order_approval
+        self.alpaca_submit_orders = alpaca_submit_orders
         self.checkpoint_path = checkpoint_path
         self.chroma_persist_dir = chroma_persist_dir
         self.bourse_cache_dir = bourse_cache_dir
@@ -133,7 +136,6 @@ class TradingGraphService:
         builder.add_node("sentiment_agent", self._sentiment_node)
         builder.add_node("technical_agent", self._technical_node)
         builder.add_node("risk_agent", self._risk_node)
-        builder.add_node("human_review", self._human_review_node)
         builder.add_node("coordinator_agent", self._coordinator_node)
         builder.add_node("enforce_limits", self._enforce_limits_node)
 
@@ -142,22 +144,7 @@ class TradingGraphService:
         builder.add_edge("prepare_context", "technical_agent")
         builder.add_edge("sentiment_agent", "risk_agent")
         builder.add_edge("technical_agent", "risk_agent")
-        builder.add_conditional_edges(
-            "risk_agent",
-            self._risk_router,
-            {
-                "human_review": "human_review",
-                "coordinator_agent": "coordinator_agent",
-            },
-        )
-        builder.add_conditional_edges(
-            "human_review",
-            self._human_review_router,
-            {
-                "coordinator_agent": "coordinator_agent",
-                "end": END,
-            },
-        )
+        builder.add_edge("risk_agent", "coordinator_agent")
         builder.add_edge("coordinator_agent", "enforce_limits")
         builder.add_edge("enforce_limits", END)
         return builder.compile(checkpointer=self.checkpointer, name="morocco-trading-single-symbol")
@@ -337,108 +324,47 @@ class TradingGraphService:
         self._persist_legacy_result(intent.request_id, result)
 
     def resume(self, request_id: str, decision: str) -> None:
-        if self.single_symbol_graph is not None:
-            self._resume_with_langgraph(request_id, decision)
-            return
+        raise ValueError("Analysis no longer pauses for human review; approve or reject the Alpaca order instead.")
 
-        saved_state = self.storage.get_saved_state(request_id)
-        if not saved_state:
-            raise ValueError("No paused state exists for this request.")
-        if decision == "rejected":
-            self.storage.update_request(request_id, status=SignalStatus.REJECTED, human_review_required=False)
-            self.storage.add_event(request_id, "human_review_rejected", {})
-            return
-
-        coordinator_output = CoordinatorOutput.model_validate(saved_state["coordinator_output"])
-        final_signal = enforce_limits(
-            symbol=saved_state["symbol"],
-            request_id=request_id,
-            coordinator_output=coordinator_output,
-            is_fixing_mode=saved_state["technical_features"]["is_fixing_mode"],
-            market_mode=saved_state["technical_features"].get("market_mode"),
-            capital=saved_state["capital"],
-        )
+    def _finalize_alpaca_preview(self, request_id: str, final_signal: TradingSignal | None) -> tuple[Any, Any]:
+        alpaca_preview = None
+        alpaca_status = None
+        if final_signal is None:
+            return alpaca_preview, alpaca_status
         alpaca_preview = self.alpaca_preview_service.prepare_preview(final_signal)
-        self.storage.update_request(
-            request_id,
-            status=SignalStatus.COMPLETED,
-            human_review_required=False,
-            final_signal=final_signal,
-            coordinator_output=coordinator_output,
-            alpaca_order=alpaca_preview,
-            alpaca_order_status=alpaca_preview.status,
-            state={},
-        )
-        self.storage.add_event(request_id, "human_review_approved", {"symbol": saved_state["symbol"]})
-        self.storage.add_event(request_id, "alpaca_preview_prepared", alpaca_preview.model_dump(mode="json"))
+        if alpaca_preview.status == AlpacaOrderStatus.PREPARED and not self.alpaca_require_order_approval:
+            alpaca_preview = self.alpaca_preview_service.approve_preview(
+                alpaca_preview,
+                submission_enabled=self.alpaca_submit_orders,
+            )
+            self.storage.add_event(request_id, "alpaca_order_auto_approved", alpaca_preview.model_dump(mode="json"))
+        else:
+            self.storage.add_event(request_id, "alpaca_preview_prepared", alpaca_preview.model_dump(mode="json"))
+        alpaca_status = alpaca_preview.status
+        return alpaca_preview, alpaca_status
 
     def _start_with_langgraph(self, intent: RequestIntent) -> None:
         symbol = intent.symbols_requested[0]
         config = self._graph_config(intent.request_id)
         initial_state = self._initial_graph_state(intent, symbol)
         result = self.single_symbol_graph.invoke(initial_state, config=config)
-        if "__interrupt__" in result:
-            snapshot = self.single_symbol_graph.get_state(config)
-            state_values = dict(snapshot.values)
-            self.storage.update_request(
-                intent.request_id,
-                status=SignalStatus.WAITING_HUMAN,
-                human_review_required=True,
-                errors=state_values.get("errors", []),
-                state=state_values,
-            )
-            self.storage.add_event(
-                intent.request_id,
-                "human_review_required",
-                {
-                    "symbol": symbol,
-                    "interrupts": [getattr(item, "value", None) for item in result.get("__interrupt__", [])],
-                },
-            )
-            return
-
-        self._persist_langgraph_completion(intent.request_id, result, human_review_required=False)
-
-    def _resume_with_langgraph(self, request_id: str, decision: str) -> None:
-        config = self._graph_config(request_id)
-        result = self.single_symbol_graph.invoke(Command(resume=decision), config=config)
-        snapshot = self.single_symbol_graph.get_state(config)
-        state_values = dict(snapshot.values)
-        if decision == "rejected" or state_values.get("human_review_decision") == "rejected":
-            self.storage.update_request(
-                request_id,
-                status=SignalStatus.REJECTED,
-                human_review_required=False,
-                errors=state_values.get("errors", []),
-                state=state_values,
-            )
-            self.storage.add_event(request_id, "human_review_rejected", {})
-            return
-
-        self.storage.add_event(request_id, "human_review_approved", {"symbol": state_values.get("symbol")})
-        self._persist_langgraph_completion(request_id, result, human_review_required=False, prepare_alpaca_preview=True)
+        self._persist_langgraph_completion(intent.request_id, result)
 
     def _persist_langgraph_completion(
         self,
         request_id: str,
         result: dict[str, Any],
-        *,
-        human_review_required: bool,
-        prepare_alpaca_preview: bool = False,
     ) -> None:
         final_signal = self._coerce_model(result.get("final_signal"), TradingSignal)
         coordinator_output = self._coerce_model(result.get("coordinator_output"), CoordinatorOutput)
-        alpaca_preview = None
-        alpaca_status = None
-        if prepare_alpaca_preview and final_signal is not None:
-            alpaca_preview = self.alpaca_preview_service.prepare_preview(final_signal)
-            alpaca_status = alpaca_preview.status
-            self.storage.add_event(request_id, "alpaca_preview_prepared", alpaca_preview.model_dump(mode="json"))
+        alpaca_preview, alpaca_status = self._finalize_alpaca_preview(request_id, final_signal)
+        for warning in result.get("analysis_warning_reasons", []):
+            self.storage.add_event(request_id, "analysis_warning", {"warning": warning})
 
         self.storage.update_request(
             request_id,
             status=SignalStatus.COMPLETED,
-            human_review_required=human_review_required,
+            human_review_required=False,
             final_signal=final_signal,
             coordinator_output=coordinator_output,
             alpaca_order=alpaca_preview,
@@ -449,27 +375,21 @@ class TradingGraphService:
         self.storage.add_event(request_id, "pipeline_complete", {"symbol": final_signal.symbol if final_signal else result.get("symbol")})
 
     def _persist_legacy_result(self, request_id: str, result: dict[str, Any]) -> None:
-        if result["human_review_required"]:
-            self.storage.update_request(
-                request_id,
-                status=SignalStatus.WAITING_HUMAN,
-                human_review_required=True,
-                coordinator_output=result.get("coordinator_output"),
-                errors=result["errors"],
-                state=result,
-            )
-            self.storage.add_event(request_id, "human_review_required", {"symbol": result["symbol"]})
-            return
-
         final_signal = result["final_signal"]
         coordinator_output = result["coordinator_output"]
+        alpaca_preview, alpaca_status = self._finalize_alpaca_preview(request_id, final_signal)
+        for warning in result.get("analysis_warning_reasons", []):
+            self.storage.add_event(request_id, "analysis_warning", {"warning": warning})
         self.storage.update_request(
             request_id,
             status=SignalStatus.COMPLETED,
             human_review_required=False,
             final_signal=final_signal,
             coordinator_output=coordinator_output,
+            alpaca_order=alpaca_preview,
+            alpaca_order_status=alpaca_status,
             errors=result["errors"],
+            state=result,
         )
         self.storage.add_event(request_id, "pipeline_complete", {"symbol": final_signal.symbol})
 
@@ -991,21 +911,11 @@ class TradingGraphService:
         )
         self.storage.add_event(intent.request_id, "agent_complete", {"agent": "risk"})
         self._active_state_context["risk_output"] = risk_output
-        daily_limit = market_mode_daily_limit(technical_features.get("market_mode"))
-        bias_delta = abs(
-            sentiment_output.sentiment_score
-            - (
-                0.8
-                if technical_output.directional_bias == "BULLISH"
-                else 0.2
-                if technical_output.directional_bias == "BEARISH"
-                else 0.5
-            )
-        )
-        human_review_required = (
-            risk_output.volatility_estimate > 0.50
-            or risk_output.stop_loss_pct > daily_limit * 0.8
-            or bias_delta > 0.4
+        analysis_warning_reasons = self._analysis_warning_reasons(
+            sentiment_output=sentiment_output,
+            technical_output=technical_output,
+            risk_output=risk_output,
+            technical_features=technical_features,
         )
 
         self.storage.add_event(intent.request_id, "agent_start", {"agent": "coordinator", "symbol": symbol})
@@ -1017,16 +927,14 @@ class TradingGraphService:
         )
         self.storage.add_event(intent.request_id, "agent_complete", {"agent": "coordinator"})
 
-        final_signal = None
-        if not human_review_required:
-            final_signal = enforce_limits(
-                symbol=symbol,
-                request_id=intent.request_id,
-                coordinator_output=coordinator_output,
-                is_fixing_mode=technical_features["is_fixing_mode"],
-                market_mode=technical_features.get("market_mode"),
-                capital=intent.capital_mad,
-            )
+        final_signal = enforce_limits(
+            symbol=symbol,
+            request_id=intent.request_id,
+            coordinator_output=coordinator_output,
+            is_fixing_mode=technical_features["is_fixing_mode"],
+            market_mode=technical_features.get("market_mode"),
+            capital=intent.capital_mad,
+        )
         return {
             "symbol": symbol,
             "capital": intent.capital_mad,
@@ -1041,12 +949,40 @@ class TradingGraphService:
             "technical_messages": technical_messages,
             "risk_messages": risk_messages,
             "coordinator_messages": coordinator_messages,
-            "human_review_required": human_review_required,
+            "analysis_warning_reasons": analysis_warning_reasons,
             "errors": [*sentiment_errors, *technical_errors, *risk_errors, *coordinator_errors],
         }
 
     def _graph_config(self, request_id: str) -> dict[str, Any]:
         return {"configurable": {"thread_id": request_id}}
+
+    def _analysis_warning_reasons(
+        self,
+        *,
+        sentiment_output: SentimentOutput,
+        technical_output: TechnicalOutput,
+        risk_output: RiskOutput,
+        technical_features: dict[str, Any],
+    ) -> list[str]:
+        daily_limit = market_mode_daily_limit(technical_features.get("market_mode"))
+        bias_delta = abs(
+            sentiment_output.sentiment_score
+            - (
+                0.8
+                if technical_output.directional_bias == "BULLISH"
+                else 0.2
+                if technical_output.directional_bias == "BEARISH"
+                else 0.5
+            )
+        )
+        warnings: list[str] = []
+        if risk_output.volatility_estimate > 0.50:
+            warnings.append("Volatilite elevee: le dossier merite une verification operateur avant application de l'ordre.")
+        if risk_output.stop_loss_pct > daily_limit * 0.8:
+            warnings.append("Stop loss proche de la limite quotidienne: execution a surveiller.")
+        if bias_delta > 0.4:
+            warnings.append("Desaccord marque entre le sentiment et le signal technique.")
+        return warnings
 
     def _initial_graph_state(self, intent: RequestIntent, symbol: str) -> GraphState:
         return {
@@ -1070,8 +1006,7 @@ class TradingGraphService:
             "risk_messages": [],
             "coordinator_messages": [],
             "technical_retry_count": 0,
-            "human_review_required": False,
-            "human_review_decision": None,
+            "analysis_warning_reasons": [],
             "started_at": datetime.now(timezone.utc),
             "errors": [],
         }
@@ -1156,45 +1091,18 @@ class TradingGraphService:
         )
         self.storage.add_event(state["request_id"], "agent_complete", {"agent": "risk"})
         self._active_state_context["risk_output"] = risk_output
-        daily_limit = market_mode_daily_limit(technical_features.get("market_mode"))
-        bias_delta = abs(
-            sentiment_output.sentiment_score
-            - (
-                0.8
-                if technical_output.directional_bias == "BULLISH"
-                else 0.2
-                if technical_output.directional_bias == "BEARISH"
-                else 0.5
-            )
-        )
-        human_review_required = (
-            risk_output.volatility_estimate > 0.50
-            or risk_output.stop_loss_pct > daily_limit * 0.8
-            or bias_delta > 0.4
+        analysis_warning_reasons = self._analysis_warning_reasons(
+            sentiment_output=sentiment_output,
+            technical_output=technical_output,
+            risk_output=risk_output,
+            technical_features=technical_features,
         )
         return {
             "risk_output": risk_output.model_dump(mode="json"),
             "risk_messages": risk_messages,
-            "human_review_required": human_review_required,
+            "analysis_warning_reasons": analysis_warning_reasons,
             "errors": risk_errors,
         }
-
-    def _risk_router(self, state: GraphState) -> str:
-        return "human_review" if state.get("human_review_required") else "coordinator_agent"
-
-    def _human_review_node(self, state: GraphState) -> dict[str, Any]:
-        decision = interrupt(
-            {
-                "request_id": state["request_id"],
-                "symbol": state["symbol"],
-                "reason": "Human review required before coordinator execution.",
-                "risk_output": state.get("risk_output"),
-            }
-        )
-        return {"human_review_decision": decision}
-
-    def _human_review_router(self, state: GraphState) -> str:
-        return "coordinator_agent" if state.get("human_review_decision") == "approved" else "end"
 
     def _coordinator_node(self, state: GraphState) -> dict[str, Any]:
         request_intent = RequestIntent.model_validate(state["request_intent"])

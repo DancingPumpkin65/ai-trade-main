@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     alpaca_api_secret_key: str | None = Field(default=None, alias="ALPACA_API_SECRET_KEY")
     alpaca_base_url: str = Field(default="https://paper-api.alpaca.markets", alias="ALPACA_BASE_URL")
     alpaca_enabled: bool = Field(default=True, alias="ALPACA_ENABLED")
+    alpaca_require_order_approval: bool = Field(default=True, alias="ALPACA_REQUIRE_ORDER_APPROVAL")
     alpaca_submit_orders: bool = Field(default=False, alias="ALPACA_SUBMIT_ORDERS")
 
     max_universe_candidates: int = 5

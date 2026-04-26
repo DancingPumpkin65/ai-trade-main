@@ -12,7 +12,7 @@ from trading_agents.core.data.news_global import MarketAuxClient
 from trading_agents.core.data.news_morocco import MoroccoNewsClient
 from trading_agents.core.intent.normalizer import OllamaIntentNormalizer
 from trading_agents.core.intent.parser import IntentParser
-from trading_agents.core.models import GenerateSignalRequest, GenerateSignalResponse, SignalRecord, SignalStatus
+from trading_agents.core.models import AlpacaOrderStatus, GenerateSignalRequest, GenerateSignalResponse, SignalRecord, SignalStatus
 from trading_agents.core.observability import LangSmithIntentTracer
 from trading_agents.core.storage import Storage
 from trading_agents.graph.build import TradingGraphService
@@ -71,6 +71,8 @@ class AppServices:
             morocco_news_client=self.morocco_news_client,
             marketaux_client=self.marketaux_client,
             alpaca_preview_service=self.alpaca_preview_service,
+            alpaca_require_order_approval=settings.alpaca_require_order_approval,
+            alpaca_submit_orders=settings.alpaca_submit_orders,
             checkpoint_path=settings.langgraph_checkpoint_path,
             chroma_persist_dir=settings.chroma_persist_dir,
             bourse_cache_dir=settings.data_dir / "bourse_pdfs",
@@ -90,6 +92,8 @@ class AppServices:
             "langgraph_checkpoint_path": str(self.settings.langgraph_checkpoint_path),
             "langsmith_tracing": self.settings.langsmith_tracing,
             "alpaca_enabled": self.settings.alpaca_enabled,
+            "alpaca_require_order_approval": self.settings.alpaca_require_order_approval,
+            "alpaca_submit_orders": self.settings.alpaca_submit_orders,
             "langgraph_enabled": self.graph_service.langgraph_enabled,
             "rag_backend": self.graph_service.vector_store.backend_name,
             "bourse_cache_dir": str(self.settings.data_dir / "bourse_pdfs"),
@@ -124,13 +128,48 @@ class AppServices:
         return record
 
     def approve(self, request_id: str) -> SignalRecord:
-        self.storage.add_audit_log(request_id, "human_review", "Operator approved request.", {"decision": "approved"})
-        self.graph_service.resume(request_id, "approved")
+        record = self.get_signal(request_id)
+        if record.alpaca_order is None or record.alpaca_order_status != AlpacaOrderStatus.PREPARED:
+            raise ValueError("No Alpaca order preview is available for approval.")
+        approved_order = self.alpaca_preview_service.approve_preview(
+            record.alpaca_order,
+            submission_enabled=self.settings.alpaca_submit_orders,
+        )
+        self.storage.update_request(
+            request_id,
+            status=SignalStatus.COMPLETED,
+            human_review_required=False,
+            alpaca_order=approved_order,
+            alpaca_order_status=approved_order.status,
+        )
+        self.storage.add_audit_log(
+            request_id,
+            "order_approval",
+            "Operator approved the Alpaca order command.",
+            {"decision": "approved", "alpaca_order_status": approved_order.status.value},
+        )
+        self.storage.add_event(request_id, "alpaca_order_approved", approved_order.model_dump(mode="json"))
         return self.get_signal(request_id)
 
     def reject(self, request_id: str) -> SignalRecord:
-        self.storage.add_audit_log(request_id, "human_review", "Operator rejected request.", {"decision": "rejected"})
-        self.graph_service.resume(request_id, "rejected")
+        record = self.get_signal(request_id)
+        if record.alpaca_order is None or record.alpaca_order_status != AlpacaOrderStatus.PREPARED:
+            raise ValueError("No Alpaca order preview is available for rejection.")
+        rejected_order = self.alpaca_preview_service.reject_preview(record.alpaca_order)
+        self.storage.update_request(
+            request_id,
+            status=SignalStatus.COMPLETED,
+            human_review_required=False,
+            alpaca_order=rejected_order,
+            alpaca_order_status=rejected_order.status,
+        )
+        self.storage.add_audit_log(
+            request_id,
+            "order_approval",
+            "Operator rejected the Alpaca order command.",
+            {"decision": "rejected", "alpaca_order_status": rejected_order.status.value},
+        )
+        self.storage.add_event(request_id, "alpaca_order_rejected", rejected_order.model_dump(mode="json"))
         return self.get_signal(request_id)
 
     def history(self) -> list[SignalRecord]:
@@ -143,8 +182,11 @@ class AppServices:
         record = self.get_signal(request_id)
         payload = record.model_dump(mode="json")
         payload["signal_status"] = record.status.value
-        payload["human_review_required"] = record.human_review_required
+        payload["human_review_required"] = False
         payload["alpaca_order_status"] = record.alpaca_order_status.value
+        payload["order_approval_required"] = record.alpaca_order_status.value == "PREPARED"
+        saved_state = self.storage.get_saved_state(request_id) or {}
+        payload["analysis_warnings"] = saved_state.get("analysis_warning_reasons", [])
         payload["universe_scan_candidates"] = [
             candidate.model_dump(mode="json")
             for candidate in self.storage.get_universe_scan_candidates(request_id)
@@ -156,5 +198,6 @@ class AppServices:
         return {
             "request_id": request_id,
             "alpaca_order_status": record.alpaca_order_status.value,
+            "order_approval_required": record.alpaca_order_status.value == "PREPARED",
             "alpaca_order": record.alpaca_order.model_dump(mode="json") if record.alpaca_order else None,
         }

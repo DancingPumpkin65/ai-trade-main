@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from trading_agents.core.intent.policy import IntentPolicyEngine
 from trading_agents.core.models import CoordinatorOutput, IntentAlignment, RequestIntent, UserBias
 
 
@@ -11,6 +12,7 @@ def run_coordinator_agent(
     technical_output,
     risk_output,
 ) -> CoordinatorOutput:
+    policy = IntentPolicyEngine().build(request_intent)
     dissenting_views: list[str] = []
     preference_conflicts: list[str] = []
     if sentiment_output.sentiment_score >= 0.5 and technical_output.directional_bias == "BEARISH":
@@ -33,7 +35,8 @@ def run_coordinator_agent(
     rationale = (
         f"Demande comprise: {request_intent.operator_visible_note_fr} "
         f"Conclusion système sur {symbol}: {action}. "
-        f"Le comité synthétise sentiment, technique et risque avant application des garde-fous."
+        f"Le comité synthétise sentiment, technique et risque avant application des garde-fous. "
+        f"Posture appliquee: {policy.coordinator_note}"
     )
     if preference_conflicts:
         rationale += " " + " ".join(preference_conflicts)

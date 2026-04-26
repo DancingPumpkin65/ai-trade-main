@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from trading_agents.core.intent.policy import IntentPolicyEngine
 from trading_agents.core.models import RequestIntent, RiskOutput
 from trading_agents.graph.helpers import calculate_position_size
 
@@ -13,13 +14,23 @@ def run_risk_agent(
     technical_features: dict,
     request_intent: RequestIntent,
 ) -> RiskOutput:
-    if technical_output.directional_bias == "BULLISH" and sentiment_output.sentiment_score >= 0.5:
+    policy = IntentPolicyEngine().build(request_intent)
+    bullish_threshold = 0.5
+    bearish_threshold = 0.5
+    if policy.execution_patience == "patient":
+        bullish_threshold = 0.55
+        bearish_threshold = 0.45
+    elif policy.execution_patience == "fast":
+        bullish_threshold = 0.48
+        bearish_threshold = 0.52
+
+    if technical_output.directional_bias == "BULLISH" and sentiment_output.sentiment_score >= bullish_threshold:
         action = "BUY"
-    elif technical_output.directional_bias == "BEARISH" and sentiment_output.sentiment_score < 0.5:
+    elif technical_output.directional_bias == "BEARISH" and sentiment_output.sentiment_score <= bearish_threshold:
         action = "SELL"
     else:
         action = "HOLD"
-    conservative_posture = request_intent.risk_preference.value == "CONSERVATIVE"
+    conservative_posture = policy.conservative_posture
     sizing = calculate_position_size(
         symbol=symbol,
         action=action,
@@ -34,6 +45,7 @@ def run_risk_agent(
     rationale = (
         f"Action proposée: {action}. "
         f"Préférence risque: {request_intent.risk_preference.value}. "
+        f"Horizon applique: {policy.horizon_label}. "
         f"Volatilité utilisée: {technical_output.volatility_estimate:.2%}."
     )
     return RiskOutput(

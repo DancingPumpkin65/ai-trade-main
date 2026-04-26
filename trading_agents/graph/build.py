@@ -699,12 +699,15 @@ class TradingGraphService:
                 score += 0.25
         return score
 
-    def _liquidity_score(self, stock: StockInfo, features) -> tuple[float, str]:
-        if stock.last_volume >= 1_000_000 and features.zero_volume_bar_count == 0:
+    def _liquidity_score(self, stock: StockInfo, features, policy) -> tuple[float, str]:
+        strong_threshold = policy.min_liquidity_mad * 4
+        base_threshold = policy.min_liquidity_mad
+        weak_threshold = max(25_000.0, policy.min_liquidity_mad * 0.35)
+        if stock.last_volume >= strong_threshold and features.zero_volume_bar_count == 0:
             return 0.25, "Liquidite solide"
-        if stock.last_volume >= 100_000 and features.zero_volume_bar_count <= 1:
+        if stock.last_volume >= base_threshold and features.zero_volume_bar_count <= 1:
             return 0.15, "Liquidite correcte"
-        if stock.last_volume >= 25_000:
+        if stock.last_volume >= weak_threshold:
             return 0.05, "Liquidite limitee"
         return -0.2, "Liquidite insuffisante"
 
@@ -718,12 +721,13 @@ class TradingGraphService:
             score += 0.1 * policy.technical_weight
             reasons.append("Biais technique neutre")
         if 48 <= features.rsi14 <= 68:
-            score += 0.08
+            score += 0.08 + policy.momentum_bonus
             reasons.append("Momentum exploitable")
-        if features.annualized_volatility <= 0.35 * max(policy.volatility_penalty, 0.1):
+        compatibility_threshold = min(policy.volatility_ceiling, 0.35 * max(policy.volatility_penalty, 0.1))
+        if features.annualized_volatility <= compatibility_threshold:
             score += 0.12
             reasons.append("Volatilite compatible")
-        elif features.annualized_volatility >= 0.75:
+        elif features.annualized_volatility >= policy.volatility_ceiling:
             score -= 0.1
             reasons.append("Volatilite elevee")
         return score, reasons
@@ -754,25 +758,30 @@ class TradingGraphService:
         score += technical_score
         reasons.extend(technical_reasons)
 
-        liquidity_score, liquidity_reason = self._liquidity_score(stock, features)
+        liquidity_score, liquidity_reason = self._liquidity_score(stock, features, policy)
         score += liquidity_score
         reasons.append(liquidity_reason)
 
         if relevant_chunks:
-            catalyst_score = min(0.3, freshness_score * 0.08 * policy.news_weight)
+            catalyst_score = min(0.3 + policy.freshness_bonus, freshness_score * 0.08 * policy.news_weight)
             score += catalyst_score
             reasons.append(f"{len(relevant_chunks)} catalyseur(s) retrouve(s)")
         if notice_count:
-            score += min(0.22, notice_count * 0.08 * policy.news_weight)
+            score += min(0.22 + policy.freshness_bonus, notice_count * 0.08 * policy.notice_weight)
             reasons.append(f"{notice_count} avis/publication(s) emetteur")
-        if intent.time_horizon.value == "SHORT_TERM" and freshness_score > 0:
-            score += 0.08
-            reasons.append("Catalyseurs recents adaptes au court terme")
+        if intent.time_horizon.value in {"SHORT_TERM", "INTRADAY"} and freshness_score > 0:
+            score += policy.freshness_bonus
+            reasons.append("Catalyseurs recents adaptes a l'horizon demande")
+        elif intent.time_horizon.value == "SWING" and freshness_score > 0:
+            score += min(policy.freshness_bonus, 0.04)
+            reasons.append("Catalyseurs compatibles avec une lecture plus large")
 
-        if stock.last_volume < 25_000 or features.zero_volume_bar_count >= 3:
+        if stock.last_volume < policy.min_liquidity_mad or features.zero_volume_bar_count >= 3:
             return None, f"{stock.symbol}: liquidite trop faible pour un scan exploitable."
         if score < 0.38:
             return None, f"{stock.symbol}: score preliminaire insuffisant ({score:.2f})."
+        if not relevant_chunks and policy.horizon_label in {"intraday", "short-term"}:
+            return None, f"{stock.symbol}: aucun catalyseur recent pour l'horizon demande."
         if not relevant_chunks and features.directional_bias != "BULLISH":
             return None, f"{stock.symbol}: aucun catalyseur recent et biais technique non haussier."
 

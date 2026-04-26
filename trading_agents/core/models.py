@@ -52,6 +52,13 @@ class AlpacaOrderStatus(str, Enum):
     UNMAPPABLE = "UNMAPPABLE"
 
 
+class MarketMode(str, Enum):
+    CONTINUOUS = "CONTINUOUS"
+    FIXING = "FIXING"
+    BOND = "BOND"
+    UNKNOWN = "UNKNOWN"
+
+
 class StockInfo(BaseModel):
     symbol: str
     name: str
@@ -61,6 +68,8 @@ class StockInfo(BaseModel):
     last_volume: float = 0.0
     high_52w: float = 0.0
     low_52w: float = 0.0
+    market_mode: MarketMode = MarketMode.UNKNOWN
+    market_metadata: dict = Field(default_factory=dict)
     ohlcv: list[dict] = Field(default_factory=list)
 
 
@@ -88,6 +97,7 @@ class TechnicalFeatures(BaseModel):
     directional_bias: str
     annualized_volatility: float
     zero_volume_bar_count: int
+    market_mode: MarketMode = MarketMode.UNKNOWN
     is_fixing_mode: bool = False
 
 
@@ -98,6 +108,7 @@ class PositionSizing(BaseModel):
     take_profit_pct: float
     risk_score: float
     volatility_estimate: float
+    market_mode: MarketMode = MarketMode.UNKNOWN
     is_fixing_mode: bool = False
 
 
@@ -172,6 +183,7 @@ class TradingSignal(BaseModel):
     gap_risk_warning: str | None = None
     rationale_fr: str
     confidence: float
+    market_mode: MarketMode = MarketMode.UNKNOWN
     is_fixing_mode: bool
     request_id: str
     generated_at: datetime

@@ -7,7 +7,7 @@ from math import sin
 import httpx
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from trading_agents.core.models import StockInfo
+from trading_agents.core.models import MarketMode, StockInfo
 
 
 SAMPLE_STOCKS = [
@@ -80,6 +80,7 @@ class DrahmiClient:
 
     def _payload_to_stock(self, payload: dict) -> StockInfo:
         symbol = payload.get("ticker") or payload.get("symbol") or "UNKNOWN"
+        market_mode = self._extract_market_mode(payload)
         stock = StockInfo(
             symbol=symbol,
             name=payload.get("name", symbol),
@@ -89,6 +90,15 @@ class DrahmiClient:
             last_volume=float(payload.get("last_volume") or payload.get("volume") or 0.0),
             high_52w=float(payload.get("high_52w") or payload.get("fifty_two_week_high") or 0.0),
             low_52w=float(payload.get("low_52w") or payload.get("fifty_two_week_low") or 0.0),
+            market_mode=market_mode,
+            market_metadata={
+                "market_mode": payload.get("market_mode"),
+                "trading_mode": payload.get("trading_mode"),
+                "quote_mode": payload.get("quote_mode"),
+                "instrument_type": payload.get("instrument_type"),
+                "asset_type": payload.get("asset_type"),
+                "compartment": payload.get("compartment"),
+            },
             ohlcv=self._normalize_history(payload.get("history", [])),
         )
         return stock
@@ -103,8 +113,32 @@ class DrahmiClient:
             last_volume=2_500_000.0,
             high_52w=float(item["price"]) * 1.15,
             low_52w=float(item["price"]) * 0.75,
+            market_mode=MarketMode.CONTINUOUS,
+            market_metadata={"market_mode": "continuous"},
             ohlcv=self._sample_history(float(item["price"])),
         )
+
+    def _extract_market_mode(self, payload: dict) -> MarketMode:
+        haystack = " ".join(
+            str(payload.get(key, ""))
+            for key in (
+                "market_mode",
+                "trading_mode",
+                "quote_mode",
+                "instrument_type",
+                "asset_type",
+                "compartment",
+                "sector",
+                "name",
+            )
+        ).lower()
+        if any(token in haystack for token in ("bond", "obligation", "fixed income", "treasury", "debt")):
+            return MarketMode.BOND
+        if any(token in haystack for token in ("fixing", "fixe")):
+            return MarketMode.FIXING
+        if any(token in haystack for token in ("continuous", "continu")):
+            return MarketMode.CONTINUOUS
+        return MarketMode.UNKNOWN
 
     def _sample_history(self, base_price: float) -> list[dict]:
         bars = []

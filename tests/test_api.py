@@ -318,6 +318,15 @@ def test_agent_scratchpads_and_tool_events_are_recorded(tmp_path: Path, monkeypa
     event_types = [event["event_type"] for event in events]
     assert "tool_call" in event_types
     assert "tool_result" in event_types
+    tool_names = {
+        event["payload"]["tool"]
+        for event in events
+        if event["event_type"] == "tool_call" and "tool" in event["payload"]
+    }
+    assert "get_request_intent" in tool_names
+    assert "get_technical_features" in tool_names
+    assert "get_symbol" in tool_names
+    assert "get_policy_note" in tool_names
 
 
 def test_agent_iteration_cap_falls_back_safely(tmp_path: Path, monkeypatch):

@@ -199,13 +199,7 @@ class TradingGraphService:
         request_intent = self._active_state_context.get("request_intent")
         if request_intent is None:
             return None
-        policy = self.policy_engine.build(request_intent)
-        return {
-            "horizon_label": policy.horizon_label,
-            "execution_patience": policy.execution_patience,
-            "coordinator_note": policy.coordinator_note,
-            "conservative_posture": policy.conservative_posture,
-        }
+        return self.policy_engine.build_coordinator_prompt_context(request_intent)
 
     def _calculate_size_from_active_context(self, symbol: str, action: str, capital: float):
         technical_features = self._get_active_technical_features()
@@ -723,6 +717,7 @@ class TradingGraphService:
                 sentiment_output=SentimentOutput.model_validate(aggregated["sentiment"]),
                 technical_output=TechnicalOutput.model_validate(aggregated["technical"]),
                 risk_output=RiskOutput.model_validate(aggregated["risk"]),
+                policy_context=policy_note,
             )
             messages.append({"role": "assistant", "iteration": iteration, "content": "Coordinator synthesis completed."})
             return output, messages, errors

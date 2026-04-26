@@ -11,8 +11,11 @@ def run_coordinator_agent(
     sentiment_output,
     technical_output,
     risk_output,
+    policy_context: dict | None = None,
 ) -> CoordinatorOutput:
-    policy = IntentPolicyEngine().build(request_intent)
+    policy_engine = IntentPolicyEngine()
+    policy = policy_engine.build(request_intent)
+    context = policy_context or policy_engine.build_coordinator_prompt_context(request_intent)
     dissenting_views: list[str] = []
     preference_conflicts: list[str] = []
     if sentiment_output.sentiment_score >= 0.5 and technical_output.directional_bias == "BEARISH":
@@ -32,14 +35,28 @@ def run_coordinator_agent(
         alignment = IntentAlignment.PARTIALLY_ALIGNED
         preference_conflicts.append("Le signal reste opportuniste mais la taille est réduite pour respecter la prudence demandée.")
 
-    rationale = (
-        f"Demande comprise: {request_intent.operator_visible_note_fr} "
-        f"Conclusion système sur {symbol}: {action}. "
-        f"Le comité synthétise sentiment, technique et risque avant application des garde-fous. "
-        f"Posture appliquee: {policy.coordinator_note}"
+    sentiment_tone = (
+        "sentiment favorable"
+        if sentiment_output.sentiment_score >= 0.55
+        else "sentiment prudent"
+        if sentiment_output.sentiment_score <= 0.45
+        else "sentiment mitige"
     )
+    technical_tone = {
+        "BULLISH": "biais technique haussier",
+        "BEARISH": "biais technique baissier",
+    }.get(technical_output.directional_bias, "biais technique neutre")
+    sections = [
+        f"{context['request_frame']}: {request_intent.operator_visible_note_fr}",
+        f"{context['interpretation_frame']}: {context['interpretation_focus']} Le dossier combine {sentiment_tone} et {technical_tone}.",
+        f"{context['recommendation_frame']} sur {symbol}: {action}.",
+        f"{context['synthesis_frame']}: {policy.coordinator_note}",
+    ]
+    if dissenting_views:
+        sections.append(f"{context['dissent_frame']}: {' '.join(dissenting_views)}")
     if preference_conflicts:
-        rationale += " " + " ".join(preference_conflicts)
+        sections.append(f"{context['conflict_frame']}: {' '.join(preference_conflicts)}")
+    rationale = " ".join(section.strip() for section in sections if section.strip())
     return CoordinatorOutput(
         action=action,
         position_size_pct=risk_output.position_size_pct,

@@ -64,3 +64,31 @@ def test_policy_swing_tolerates_wider_horizon_than_intraday():
     assert swing.min_liquidity_mad < intraday.min_liquidity_mad
     assert swing.volatility_ceiling > intraday.volatility_ceiling
     assert swing.execution_patience == "patient"
+
+
+def test_coordinator_prompt_context_changes_with_horizon():
+    engine = IntentPolicyEngine()
+    intraday_context = engine.build_coordinator_prompt_context(
+        RequestIntent(
+            request_id="x",
+            symbols_requested=["ATW"],
+            capital_mad=100000,
+            request_mode=RequestMode.SINGLE_SYMBOL,
+            risk_preference=RiskPreference.BALANCED,
+            time_horizon=TimeHorizon.INTRADAY,
+        )
+    )
+    swing_context = engine.build_coordinator_prompt_context(
+        RequestIntent(
+            request_id="y",
+            symbols_requested=["ATW"],
+            capital_mad=100000,
+            request_mode=RequestMode.SINGLE_SYMBOL,
+            risk_preference=RiskPreference.BALANCED,
+            time_horizon=TimeHorizon.SWING,
+        )
+    )
+    assert intraday_context["interpretation_frame"] == "Lecture systeme intraday"
+    assert "liquidite immediate" in intraday_context["interpretation_focus"]
+    assert swing_context["interpretation_frame"] == "Lecture systeme swing"
+    assert "plusieurs seances" in swing_context["interpretation_focus"]

@@ -115,6 +115,7 @@ def test_generate_universe_scan(tmp_path: Path, monkeypatch):
     payload = detail.json()
     assert payload["request_intent"]["request_mode"] == "UNIVERSE_SCAN"
     assert "opportunity_list" in payload
+    assert "universe_scan_candidates" in payload
 
 
 def test_human_review_approve_flow(tmp_path: Path, monkeypatch):
@@ -434,3 +435,60 @@ def test_universe_scan_threshold_rejects_weak_candidates_before_deep_eval(tmp_pa
     assert result.top_opportunities == []
     assert result.rejected_candidates_summary
     assert any("insuffisant" in item.lower() or "liquidite" in item.lower() for item in result.rejected_candidates_summary)
+
+
+def test_universe_scan_candidates_are_persisted_with_ranking_statuses(tmp_path: Path, monkeypatch):
+    _configure_env(tmp_path, monkeypatch)
+    client = TestClient(app)
+    services = get_services()
+
+    strong = _trend_stock("ATW", "Attijariwafa Bank", last_volume=2_400_000.0, step=1.7)
+    weak = _trend_stock("WEAK", "Weak Name", last_volume=500.0, step=-0.2)
+
+    async def fake_ingest_news(symbol=None):
+        return None
+
+    async def fake_list_stocks():
+        return [strong, weak]
+
+    async def fake_get_stock(symbol: str):
+        return {"ATW": strong, "WEAK": weak}[symbol.upper()]
+
+    def fake_search_news(query, top_k=8, filters=None, metadata=None):
+        if "ATW" in query:
+            return [
+                NewsChunk(
+                    chunk_id="atw-1",
+                    text="ATW annonce un dividende et une hausse de resultat.",
+                    source="Casablanca Bourse PDF",
+                    published_at=datetime.now(timezone.utc) - timedelta(days=1),
+                    similarity_score=0.95,
+                    url="https://example.com/atw-1",
+                    metadata={"doc_type": "corporate_notices", "ticker": "ATW"},
+                )
+            ]
+        return []
+
+    services.graph_service.ingest_news = fake_ingest_news
+    services.graph_service.drahmi_client.list_stocks = fake_list_stocks
+    services.graph_service.drahmi_client.get_stock = fake_get_stock
+    services.graph_service.retriever.search_news = fake_search_news
+
+    response = client.post("/signals/generate", json={"prompt": "I have 100,000 MAD. What are the best possible trades this week?"})
+    assert response.status_code == 200
+    request_id = response.json()["request_id"]
+
+    detail = client.get(f"/signals/{request_id}")
+    assert detail.status_code == 200
+    payload = detail.json()
+    candidates = payload["universe_scan_candidates"]
+    assert candidates
+    assert any(candidate["selected_for_deep_eval"] for candidate in candidates)
+    assert any(candidate["evaluation_status"] == "ACCEPTED_OPPORTUNITY" for candidate in candidates)
+    assert any(candidate["evaluation_status"] in {"REJECTED_PRE_FILTER", "REJECTED_AFTER_DEEP_EVAL"} for candidate in candidates)
+    ranked_positions = [
+        candidate["rank_position"]
+        for candidate in candidates
+        if candidate["rank_position"] is not None
+    ]
+    assert ranked_positions == sorted(ranked_positions)

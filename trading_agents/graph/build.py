@@ -27,6 +27,7 @@ from trading_agents.core.models import (
     TradeOpportunity,
     TradeOpportunityList,
     TradingSignal,
+    UniverseScanCandidateRecord,
 )
 from trading_agents.core.observability import LangSmithRetrievalTracer
 from trading_agents.core.rag.indexer import Indexer
@@ -857,6 +858,7 @@ class TradingGraphService:
         policy = self.policy_engine.build(intent)
         ranked: list[RankedCandidate] = []
         rejected: list[str] = []
+        candidate_records: list[UniverseScanCandidateRecord] = []
         self._active_state_context = {
             "request_id": intent.request_id,
             "request_intent": intent,
@@ -865,11 +867,46 @@ class TradingGraphService:
             candidate, rejection_reason = self._rank_universe_candidate(intent, stock, policy)
             if candidate is not None:
                 ranked.append(candidate)
+                candidate_records.append(
+                    UniverseScanCandidateRecord(
+                        request_id=intent.request_id,
+                        symbol=candidate.symbol,
+                        score=candidate.score,
+                        reasons=candidate.reasons,
+                        selected_for_deep_eval=False,
+                        rank_position=None,
+                        evaluation_status="RANKED",
+                    )
+                )
             elif rejection_reason is not None:
                 rejected.append(rejection_reason)
+                candidate_records.append(
+                    UniverseScanCandidateRecord(
+                        request_id=intent.request_id,
+                        symbol=stock.symbol,
+                        score=None,
+                        reasons=[],
+                        selected_for_deep_eval=False,
+                        rank_position=None,
+                        evaluation_status="REJECTED_PRE_FILTER",
+                        rejection_reason=rejection_reason,
+                    )
+                )
         ranked.sort(key=lambda item: item.score, reverse=True)
+        record_by_symbol = {item.symbol: item for item in candidate_records}
+        for rank_position, candidate in enumerate(ranked, start=1):
+            record = record_by_symbol.get(candidate.symbol)
+            if record is not None:
+                record.rank_position = rank_position
         selected = ranked[:5]
+        selected_symbols = {candidate.symbol for candidate in selected}
+        for symbol in selected_symbols:
+            record = record_by_symbol.get(symbol)
+            if record is not None:
+                record.selected_for_deep_eval = True
+                record.evaluation_status = "SELECTED_FOR_DEEP_EVAL"
         if not selected:
+            self.storage.replace_universe_scan_candidates(intent.request_id, candidate_records)
             return TradeOpportunityList(
                 request_id=intent.request_id,
                 capital_mad=intent.capital_mad,
@@ -881,7 +918,10 @@ class TradingGraphService:
         opportunities: list[TradeOpportunity] = []
         for rank, candidate in enumerate(selected, start=1):
             result = self._run_symbol_legacy(intent, candidate.symbol)
+            record = record_by_symbol.get(candidate.symbol)
             if result["final_signal"] is not None and result["final_signal"].action != "HOLD":
+                if record is not None:
+                    record.evaluation_status = "ACCEPTED_OPPORTUNITY"
                 opportunities.append(
                     TradeOpportunity(
                         rank=rank,
@@ -891,10 +931,17 @@ class TradingGraphService:
                     )
                 )
             else:
-                rejected.append(
+                rejection_reason = (
                     f"{candidate.symbol}: aucune configuration exploitable retenue apres evaluation detaillee."
                 )
+                if record is not None:
+                    record.evaluation_status = "REJECTED_AFTER_DEEP_EVAL"
+                    record.rejection_reason = rejection_reason
+                rejected.append(
+                    rejection_reason
+                )
         opportunities = opportunities[:3]
+        self.storage.replace_universe_scan_candidates(intent.request_id, candidate_records)
         return TradeOpportunityList(
             request_id=intent.request_id,
             capital_mad=intent.capital_mad,

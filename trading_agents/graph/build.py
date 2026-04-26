@@ -164,10 +164,14 @@ class TradingGraphService:
     def _register_tools(self) -> None:
         self.mcp.register_tool("sentiment", "search_news", lambda query, top_k=5, filters=None: self.retriever.search_news(query, top_k, filters, metadata=self._retrieval_metadata(query_source="sentiment_tool", top_k=top_k)))
         self.mcp.register_tool("sentiment", "get_market_data", lambda symbol: asyncio.run(self.drahmi_client.get_stock(symbol)))
+        self.mcp.register_tool("sentiment", "get_request_intent", self._get_active_request_intent)
         self.mcp.register_tool("technical", "get_market_data", lambda symbol: asyncio.run(self.drahmi_client.get_stock(symbol)))
         self.mcp.register_tool("technical", "analyze_technical", lambda symbol: analyze_technical_features(asyncio.run(self.drahmi_client.get_stock(symbol))))
+        self.mcp.register_tool("technical", "get_request_intent", self._get_active_request_intent)
         self.mcp.register_tool("risk", "get_sentiment_output", lambda: self._active_state_context.get("sentiment_output"))
         self.mcp.register_tool("risk", "get_technical_output", lambda: self._active_state_context.get("technical_output"))
+        self.mcp.register_tool("risk", "get_technical_features", self._get_active_technical_features)
+        self.mcp.register_tool("risk", "get_request_intent", self._get_active_request_intent)
         self.mcp.register_tool("risk", "calculate_size", self._calculate_size_from_active_context)
         self.mcp.register_tool(
             "coordinator",
@@ -178,10 +182,34 @@ class TradingGraphService:
                 "risk": self._active_state_context.get("risk_output"),
             },
         )
+        self.mcp.register_tool("coordinator", "get_request_intent", self._get_active_request_intent)
+        self.mcp.register_tool("coordinator", "get_symbol", self._get_active_symbol)
+        self.mcp.register_tool("coordinator", "get_policy_note", self._get_active_policy_note)
+
+    def _get_active_request_intent(self):
+        return self._active_state_context.get("request_intent")
+
+    def _get_active_symbol(self):
+        return self._active_state_context.get("symbol")
+
+    def _get_active_technical_features(self):
+        return self._active_state_context.get("technical_features") or {}
+
+    def _get_active_policy_note(self):
+        request_intent = self._active_state_context.get("request_intent")
+        if request_intent is None:
+            return None
+        policy = self.policy_engine.build(request_intent)
+        return {
+            "horizon_label": policy.horizon_label,
+            "execution_patience": policy.execution_patience,
+            "coordinator_note": policy.coordinator_note,
+            "conservative_posture": policy.conservative_posture,
+        }
 
     def _calculate_size_from_active_context(self, symbol: str, action: str, capital: float):
-        technical_features = self._active_state_context.get("technical_features") or {}
-        request_intent = self._active_state_context.get("request_intent")
+        technical_features = self._get_active_technical_features()
+        request_intent = self._get_active_request_intent()
         conservative_posture = bool(request_intent and request_intent.risk_preference.value == "CONSERVATIVE")
         sizing = calculate_position_size(
             symbol=symbol,
@@ -497,6 +525,7 @@ class TradingGraphService:
         messages = list(scratchpad)
         errors: list[str] = []
         market_data = None
+        request_context = None
         news_chunks: list[NewsChunk] = []
         searches = 0
         for iteration in range(1, self.max_agent_iterations + 1):
@@ -505,6 +534,11 @@ class TradingGraphService:
                 market_data = self.mcp.call_tool("sentiment", "get_market_data", **args)
                 self._record_tool_interaction(request_id, "sentiment", "get_market_data", args, market_data)
                 messages.append({"role": "tool", "tool": "get_market_data", "iteration": iteration, "content": f"Loaded market data for {symbol}."})
+                continue
+            if request_context is None:
+                request_context = self.mcp.call_tool("sentiment", "get_request_intent")
+                self._record_tool_interaction(request_id, "sentiment", "get_request_intent", {}, request_context)
+                messages.append({"role": "tool", "tool": "get_request_intent", "iteration": iteration, "content": "Loaded request intent context."})
                 continue
             if searches == 0:
                 query = f"{symbol} Morocco"
@@ -525,7 +559,7 @@ class TradingGraphService:
                 continue
             output = run_sentiment_agent(
                 symbol=symbol,
-                request_intent=request_intent,
+                request_intent=RequestIntent.model_validate(request_context),
                 market_data=market_data,
                 news_chunks=news_chunks,
             )
@@ -589,6 +623,8 @@ class TradingGraphService:
         errors: list[str] = []
         sentiment_output = None
         technical_output = None
+        technical_features = None
+        request_context = None
         sizing = None
         for iteration in range(1, self.max_agent_iterations + 1):
             if sentiment_output is None:
@@ -600,6 +636,16 @@ class TradingGraphService:
                 technical_output = self.mcp.call_tool("risk", "get_technical_output")
                 self._record_tool_interaction(request_id, "risk", "get_technical_output", {}, technical_output)
                 messages.append({"role": "tool", "tool": "get_technical_output", "iteration": iteration, "content": "Loaded upstream technical output."})
+                continue
+            if technical_features is None:
+                technical_features = self.mcp.call_tool("risk", "get_technical_features")
+                self._record_tool_interaction(request_id, "risk", "get_technical_features", {}, technical_features)
+                messages.append({"role": "tool", "tool": "get_technical_features", "iteration": iteration, "content": "Loaded technical feature context."})
+                continue
+            if request_context is None:
+                request_context = self.mcp.call_tool("risk", "get_request_intent")
+                self._record_tool_interaction(request_id, "risk", "get_request_intent", {}, request_context)
+                messages.append({"role": "tool", "tool": "get_request_intent", "iteration": iteration, "content": "Loaded request intent context."})
                 continue
             sentiment_model = SentimentOutput.model_validate(sentiment_output)
             technical_model = TechnicalOutput.model_validate(technical_output)
@@ -621,14 +667,15 @@ class TradingGraphService:
                 capital=capital,
                 sentiment_output=sentiment_model,
                 technical_output=technical_model,
-                technical_features=self._active_state_context.get("technical_features") or {},
-                request_intent=request_intent,
+                technical_features=technical_features or {},
+                request_intent=RequestIntent.model_validate(request_context),
             )
             messages.append({"role": "assistant", "iteration": iteration, "content": "Risk synthesis completed."})
             return output, messages, errors
         errors.append(f"Risk agent exceeded the {self.max_agent_iterations}-iteration cap.")
         messages.append({"role": "system", "content": errors[-1]})
-        technical_model = TechnicalOutput.model_validate(self._active_state_context.get("technical_output"))
+        fallback_technical_output = technical_output or self.mcp.call_tool("risk", "get_technical_output")
+        technical_model = TechnicalOutput.model_validate(fallback_technical_output)
         return self._safe_risk_output(request_intent, technical_model), messages, errors
 
     def _run_coordinator_loop(
@@ -642,15 +689,33 @@ class TradingGraphService:
         messages = list(scratchpad)
         errors: list[str] = []
         aggregated = None
+        request_context = None
+        fetched_symbol = None
+        policy_note = None
         for iteration in range(1, self.max_agent_iterations + 1):
             if aggregated is None:
                 aggregated = self.mcp.call_tool("coordinator", "get_all_outputs")
                 self._record_tool_interaction(request_id, "coordinator", "get_all_outputs", {}, aggregated)
                 messages.append({"role": "tool", "tool": "get_all_outputs", "iteration": iteration, "content": "Loaded all upstream outputs."})
                 continue
+            if request_context is None:
+                request_context = self.mcp.call_tool("coordinator", "get_request_intent")
+                self._record_tool_interaction(request_id, "coordinator", "get_request_intent", {}, request_context)
+                messages.append({"role": "tool", "tool": "get_request_intent", "iteration": iteration, "content": "Loaded request intent context."})
+                continue
+            if fetched_symbol is None:
+                fetched_symbol = self.mcp.call_tool("coordinator", "get_symbol")
+                self._record_tool_interaction(request_id, "coordinator", "get_symbol", {}, fetched_symbol)
+                messages.append({"role": "tool", "tool": "get_symbol", "iteration": iteration, "content": "Loaded symbol context."})
+                continue
+            if policy_note is None:
+                policy_note = self.mcp.call_tool("coordinator", "get_policy_note")
+                self._record_tool_interaction(request_id, "coordinator", "get_policy_note", {}, policy_note)
+                messages.append({"role": "tool", "tool": "get_policy_note", "iteration": iteration, "content": "Loaded policy posture context."})
+                continue
             output = run_coordinator_agent(
-                symbol=symbol,
-                request_intent=request_intent,
+                symbol=fetched_symbol,
+                request_intent=RequestIntent.model_validate(request_context),
                 sentiment_output=SentimentOutput.model_validate(aggregated["sentiment"]),
                 technical_output=TechnicalOutput.model_validate(aggregated["technical"]),
                 risk_output=RiskOutput.model_validate(aggregated["risk"]),

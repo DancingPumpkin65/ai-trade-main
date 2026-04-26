@@ -16,6 +16,7 @@ from trading_agents.core.models import (
     TradeOpportunityList,
     TradingSignal,
     CoordinatorOutput,
+    UniverseScanCandidateRecord,
 )
 
 
@@ -87,6 +88,19 @@ class Storage:
                     request_id TEXT NOT NULL,
                     event_type TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS universe_scan_candidates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    score REAL,
+                    reasons_json TEXT NOT NULL DEFAULT '[]',
+                    selected_for_deep_eval INTEGER NOT NULL DEFAULT 0,
+                    rank_position INTEGER,
+                    evaluation_status TEXT NOT NULL,
+                    rejection_reason TEXT,
                     created_at TEXT NOT NULL
                 );
                 """
@@ -264,3 +278,60 @@ class Storage:
         if row is None or not row["state_json"]:
             return None
         return json.loads(row["state_json"])
+
+    def replace_universe_scan_candidates(self, request_id: str, candidates: list[UniverseScanCandidateRecord]) -> None:
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with self.connection() as conn:
+            conn.execute("DELETE FROM universe_scan_candidates WHERE request_id = ?", (request_id,))
+            conn.executemany(
+                """
+                INSERT INTO universe_scan_candidates (
+                    request_id, symbol, score, reasons_json, selected_for_deep_eval,
+                    rank_position, evaluation_status, rejection_reason, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        candidate.request_id,
+                        candidate.symbol,
+                        candidate.score,
+                        json.dumps(candidate.reasons),
+                        1 if candidate.selected_for_deep_eval else 0,
+                        candidate.rank_position,
+                        candidate.evaluation_status,
+                        candidate.rejection_reason,
+                        timestamp,
+                    )
+                    for candidate in candidates
+                ],
+            )
+
+    def get_universe_scan_candidates(self, request_id: str) -> list[UniverseScanCandidateRecord]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT request_id, symbol, score, reasons_json, selected_for_deep_eval,
+                       rank_position, evaluation_status, rejection_reason
+                FROM universe_scan_candidates
+                WHERE request_id = ?
+                ORDER BY
+                    CASE WHEN rank_position IS NULL THEN 1 ELSE 0 END,
+                    rank_position ASC,
+                    score DESC,
+                    symbol ASC
+                """,
+                (request_id,),
+            ).fetchall()
+        return [
+            UniverseScanCandidateRecord(
+                request_id=row["request_id"],
+                symbol=row["symbol"],
+                score=row["score"],
+                reasons=json.loads(row["reasons_json"]),
+                selected_for_deep_eval=bool(row["selected_for_deep_eval"]),
+                rank_position=row["rank_position"],
+                evaluation_status=row["evaluation_status"],
+                rejection_reason=row["rejection_reason"],
+            )
+            for row in rows
+        ]

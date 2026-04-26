@@ -145,6 +145,10 @@ class AppServices:
         payload["signal_status"] = record.status.value
         payload["human_review_required"] = record.human_review_required
         payload["alpaca_order_status"] = record.alpaca_order_status.value
+        payload["universe_scan_candidates"] = [
+            candidate.model_dump(mode="json")
+            for candidate in self.storage.get_universe_scan_candidates(request_id)
+        ]
         return payload
 
     def get_alpaca_order(self, request_id: str) -> dict:

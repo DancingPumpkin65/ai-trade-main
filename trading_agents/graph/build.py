@@ -35,7 +35,7 @@ from trading_agents.core.rag.store import build_vector_store
 from trading_agents.core.storage import Storage
 from trading_agents.graph.coordinator_node import run_coordinator_agent
 from trading_agents.graph.enforce_limits import enforce_limits
-from trading_agents.graph.helpers import analyze_technical_features, calculate_position_size
+from trading_agents.graph.helpers import analyze_technical_features, calculate_position_size, market_mode_daily_limit
 from trading_agents.graph.risk_node import run_risk_agent
 from trading_agents.graph.sentiment_node import run_sentiment_agent
 from trading_agents.graph.state import GraphState
@@ -217,6 +217,7 @@ class TradingGraphService:
             capital=capital,
             volatility_estimate=float(technical_features.get("annualized_volatility", 0.2)),
             is_fixing_mode=bool(technical_features.get("is_fixing_mode")),
+            market_mode=technical_features.get("market_mode"),
             conservative_posture=conservative_posture,
         )
         return sizing
@@ -248,11 +249,13 @@ class TradingGraphService:
         )
 
     def _safe_risk_output(self, request_intent: RequestIntent, technical_output: TechnicalOutput) -> RiskOutput:
+        technical_features = self._get_active_technical_features()
+        daily_limit = market_mode_daily_limit(technical_features.get("market_mode"))
         return RiskOutput(
             action="HOLD",
             position_size_pct=0.0,
             position_value_mad=0.0,
-            stop_loss_pct=min(0.02, 0.06 if technical_output.volatility_estimate > 0 else 0.10),
+            stop_loss_pct=min(0.02, daily_limit),
             take_profit_pct=0.03,
             risk_score=0.2,
             volatility_estimate=technical_output.volatility_estimate,
@@ -357,6 +360,7 @@ class TradingGraphService:
             request_id=request_id,
             coordinator_output=coordinator_output,
             is_fixing_mode=saved_state["technical_features"]["is_fixing_mode"],
+            market_mode=saved_state["technical_features"].get("market_mode"),
             capital=saved_state["capital"],
         )
         alpaca_preview = self.alpaca_preview_service.prepare_preview(final_signal)
@@ -945,7 +949,7 @@ class TradingGraphService:
         )
         self.storage.add_event(intent.request_id, "agent_complete", {"agent": "risk"})
         self._active_state_context["risk_output"] = risk_output
-        daily_limit = 0.06 if technical_features["is_fixing_mode"] else 0.10
+        daily_limit = market_mode_daily_limit(technical_features.get("market_mode"))
         bias_delta = abs(
             sentiment_output.sentiment_score
             - (
@@ -978,6 +982,7 @@ class TradingGraphService:
                 request_id=intent.request_id,
                 coordinator_output=coordinator_output,
                 is_fixing_mode=technical_features["is_fixing_mode"],
+                market_mode=technical_features.get("market_mode"),
                 capital=intent.capital_mad,
             )
         return {
@@ -1109,7 +1114,7 @@ class TradingGraphService:
         )
         self.storage.add_event(state["request_id"], "agent_complete", {"agent": "risk"})
         self._active_state_context["risk_output"] = risk_output
-        daily_limit = 0.06 if technical_features.get("is_fixing_mode") else 0.10
+        daily_limit = market_mode_daily_limit(technical_features.get("market_mode"))
         bias_delta = abs(
             sentiment_output.sentiment_score
             - (
@@ -1181,6 +1186,7 @@ class TradingGraphService:
             request_id=state["request_id"],
             coordinator_output=CoordinatorOutput.model_validate(state["coordinator_output"]),
             is_fixing_mode=technical_features.get("is_fixing_mode", False),
+            market_mode=technical_features.get("market_mode"),
             capital=state["capital"],
         )
         return {"final_signal": final_signal.model_dump(mode="json")}

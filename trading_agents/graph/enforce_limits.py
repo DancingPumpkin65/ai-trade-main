@@ -3,7 +3,13 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from trading_agents.core.models import CoordinatorOutput, MarketMode, TradingSignal
-from trading_agents.graph.helpers import is_fixing_market, market_mode_daily_limit, normalize_market_mode
+from trading_agents.graph.helpers import (
+    is_fixing_market,
+    market_mode_daily_limit,
+    market_mode_dynamic_reservation_limit,
+    market_mode_static_reservation_limit,
+    normalize_market_mode,
+)
 
 
 def enforce_limits(
@@ -24,9 +30,22 @@ def enforce_limits(
     if resolved_is_fixing_mode:
         position_size_pct *= 0.8
     position_value_mad = round(capital * position_size_pct, 2)
+    execution_warnings: list[str] = []
+    max_projected_move = max(stop_loss_pct, take_profit_pct)
+    dynamic_limit = market_mode_dynamic_reservation_limit(resolved_market_mode)
+    static_limit = market_mode_static_reservation_limit(resolved_market_mode)
+    if dynamic_limit is not None and max_projected_move > dynamic_limit:
+        execution_warnings.append(
+            "Avertissement: seuil de reservation dynamique susceptible d'etre atteint (pause de 5 minutes possible)."
+        )
+    if static_limit is not None and max_projected_move > static_limit:
+        execution_warnings.append(
+            "Avertissement: seuil de reservation statique susceptible d'etre atteint (reservation puis enchere possible)."
+        )
     gap_warning = None
     if take_profit_pct > daily_limit:
         gap_warning = "Avertissement: exécution probable sur plusieurs séances — risque de gap important."
+        execution_warnings.append(gap_warning)
     return TradingSignal(
         symbol=symbol,
         action=coordinator_output.action,
@@ -36,6 +55,7 @@ def enforce_limits(
         take_profit_pct=round(take_profit_pct, 4),
         risk_score=coordinator_output.risk_score,
         gap_risk_warning=gap_warning,
+        execution_warnings=execution_warnings,
         rationale_fr=coordinator_output.rationale_fr,
         confidence=coordinator_output.confidence,
         market_mode=resolved_market_mode,

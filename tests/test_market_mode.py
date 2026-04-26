@@ -1,7 +1,12 @@
 from trading_agents.core.data.drahmi import DrahmiClient
 from trading_agents.core.models import CoordinatorOutput, MarketMode, StockInfo
 from trading_agents.graph.enforce_limits import enforce_limits
-from trading_agents.graph.helpers import analyze_technical_features, market_mode_daily_limit
+from trading_agents.graph.helpers import (
+    analyze_technical_features,
+    market_mode_daily_limit,
+    market_mode_dynamic_reservation_limit,
+    market_mode_static_reservation_limit,
+)
 
 
 def _stock_with_mode(mode: MarketMode, *, price: float = 120.0, volume: float = 1_000_000.0) -> StockInfo:
@@ -95,6 +100,8 @@ def test_enforce_limits_applies_fixing_haircut_from_market_mode():
     assert signal.is_fixing_mode is True
     assert signal.position_size_pct == 0.04
     assert signal.stop_loss_pct == market_mode_daily_limit(MarketMode.FIXING)
+    assert any("reservation dynamique" in item.lower() for item in signal.execution_warnings)
+    assert any("reservation statique" in item.lower() for item in signal.execution_warnings)
 
 
 def test_enforce_limits_preserves_bond_detection_without_fixing_haircut():
@@ -121,9 +128,43 @@ def test_enforce_limits_preserves_bond_detection_without_fixing_haircut():
     assert signal.position_size_pct == 0.05
     assert signal.stop_loss_pct == 0.02
     assert signal.gap_risk_warning is not None
+    assert len(signal.execution_warnings) == 1
 
 
 def test_market_mode_daily_limit_uses_bond_limit():
     assert market_mode_daily_limit(MarketMode.BOND) == 0.02
     assert market_mode_daily_limit(MarketMode.FIXING) == 0.06
     assert market_mode_daily_limit(MarketMode.CONTINUOUS) == 0.10
+
+
+def test_market_mode_reservation_limits_match_local_spec():
+    assert market_mode_dynamic_reservation_limit(MarketMode.CONTINUOUS) == 0.03
+    assert market_mode_dynamic_reservation_limit(MarketMode.FIXING) == 0.03
+    assert market_mode_dynamic_reservation_limit(MarketMode.BOND) is None
+    assert market_mode_static_reservation_limit(MarketMode.CONTINUOUS) == 0.06
+    assert market_mode_static_reservation_limit(MarketMode.FIXING) == 0.04
+    assert market_mode_static_reservation_limit(MarketMode.BOND) is None
+
+
+def test_enforce_limits_adds_dynamic_but_not_static_warning_for_continuous_mid_range_move():
+    coordinator_output = CoordinatorOutput(
+        action="BUY",
+        position_size_pct=0.04,
+        stop_loss_pct=0.025,
+        take_profit_pct=0.05,
+        risk_score=0.35,
+        rationale_fr="Continuous warning test",
+        dissenting_views=[],
+        confidence=0.6,
+    )
+    signal = enforce_limits(
+        symbol="ATW",
+        request_id="req-cont",
+        coordinator_output=coordinator_output,
+        is_fixing_mode=False,
+        market_mode=MarketMode.CONTINUOUS,
+        capital=100_000.0,
+    )
+    assert any("reservation dynamique" in item.lower() for item in signal.execution_warnings)
+    assert not any("reservation statique" in item.lower() for item in signal.execution_warnings)
+    assert signal.gap_risk_warning is None

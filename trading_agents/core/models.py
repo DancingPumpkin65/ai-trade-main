@@ -181,6 +181,7 @@ class TradingSignal(BaseModel):
     take_profit_pct: float
     risk_score: float
     gap_risk_warning: str | None = None
+    execution_warnings: list[str] = Field(default_factory=list)
     rationale_fr: str
     confidence: float
     market_mode: MarketMode = MarketMode.UNKNOWN

@@ -63,6 +63,22 @@ def market_mode_daily_limit(mode: MarketMode | str | None) -> float:
     return 0.10
 
 
+def market_mode_static_reservation_limit(mode: MarketMode | str | None) -> float | None:
+    resolved = normalize_market_mode(mode)
+    if resolved == MarketMode.FIXING:
+        return 0.04
+    if resolved == MarketMode.CONTINUOUS:
+        return 0.06
+    return None
+
+
+def market_mode_dynamic_reservation_limit(mode: MarketMode | str | None) -> float | None:
+    resolved = normalize_market_mode(mode)
+    if resolved == MarketMode.BOND:
+        return None
+    return 0.03
+
+
 def analyze_technical_features(stock: StockInfo) -> TechnicalFeatures:
     closes = [bar["close"] for bar in stock.ohlcv if bar.get("close") is not None]
     highs = [bar["high"] for bar in stock.ohlcv if bar.get("high") is not None]

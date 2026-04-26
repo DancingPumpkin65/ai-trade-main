@@ -196,6 +196,17 @@ class RankedCandidate(BaseModel):
     reasons: list[str]
 
 
+class UniverseScanCandidateRecord(BaseModel):
+    request_id: str
+    symbol: str
+    score: float | None = None
+    reasons: list[str] = Field(default_factory=list)
+    selected_for_deep_eval: bool = False
+    rank_position: int | None = None
+    evaluation_status: str
+    rejection_reason: str | None = None
+
+
 class TradeOpportunity(BaseModel):
     rank: int
     signal: TradingSignal

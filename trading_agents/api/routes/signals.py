@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, Query
 from sse_starlette.sse import EventSourceResponse
 
 from trading_agents.api.deps import get_services
-from trading_agents.core.models import GenerateSignalRequest
+from trading_agents.core.models import GenerateSignalRequest, RiskPreference, SignalStatus, TimeHorizon
 
 
 router = APIRouter(prefix="/signals", tags=["signals"])
@@ -23,17 +23,66 @@ def generate(payload: GenerateSignalRequest):
 
 
 @router.get("/generate/stream")
-def stream(request_id: str = Query(...)):
+def stream(
+    request_id: str | None = Query(default=None),
+    symbol: str | None = Query(default=None),
+    capital: float | None = Query(default=None),
+    prompt: str | None = Query(default=None),
+    risk_profile: RiskPreference | None = Query(default=None),
+    time_horizon: TimeHorizon | None = Query(default=None),
+):
     services = get_services()
-    events = services.stream_events(request_id)
+    created_live_request = False
+
+    if request_id is None:
+        payload = GenerateSignalRequest(
+            symbol=symbol,
+            capital=capital,
+            prompt=prompt,
+            risk_profile=risk_profile,
+            time_horizon=time_horizon,
+        )
+        try:
+            generated = services.generate_live(payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        request_id = generated.request_id
+        created_live_request = True
+
+    terminal_statuses = {
+        SignalStatus.COMPLETED.value,
+        SignalStatus.FAILED.value,
+        SignalStatus.APPROVED.value,
+        SignalStatus.REJECTED.value,
+    }
 
     def event_generator():
-        for event in events:
-            time.sleep(0.01)
+        last_event_id = 0
+        if created_live_request:
             yield {
-                "event": event["event_type"],
-                "data": json.dumps(event["payload"]),
+                "event": "request_started",
+                "data": json.dumps({"request_id": request_id, "status": SignalStatus.RUNNING.value}),
             }
+
+        while True:
+            events = services.stream_events_after(request_id, last_event_id)
+            if events:
+                for event in events:
+                    last_event_id = event["id"]
+                    yield {
+                        "event": event["event_type"],
+                        "data": json.dumps(event["payload"]),
+                    }
+
+            try:
+                record = services.get_signal(request_id)
+            except ValueError:
+                break
+
+            if record.status.value in terminal_statuses and not events:
+                break
+
+            time.sleep(0.05)
 
     return EventSourceResponse(event_generator())
 

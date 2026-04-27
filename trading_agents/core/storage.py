@@ -224,6 +224,27 @@ class Storage:
             for row in rows
         ]
 
+    def get_events_after(self, request_id: str, after_id: int = 0) -> list[dict]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, event_type, payload_json, created_at
+                FROM signal_events
+                WHERE request_id = ? AND id > ?
+                ORDER BY id ASC
+                """,
+                (request_id, after_id),
+            ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "event_type": row["event_type"],
+                "payload": json.loads(row["payload_json"]),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
     def get_request_row(self, request_id: str) -> sqlite3.Row | None:
         with self.connection() as conn:
             return conn.execute("SELECT * FROM signal_requests WHERE request_id = ?", (request_id,)).fetchone()

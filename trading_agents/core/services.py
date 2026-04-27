@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import threading
 from datetime import datetime, timezone
 
 from trading_agents.core.broker.alpaca import AlpacaPreviewService
@@ -82,6 +83,43 @@ class AppServices:
         )
         self.auth_service = AuthService(self.storage, settings.secret_key)
 
+    def _prepare_request(self, payload: GenerateSignalRequest):
+        intent = self.intent_parser.parse(payload)
+        self.storage.create_request(intent.request_id, intent)
+        self.storage.add_audit_log(
+            intent.request_id,
+            "intent_parsed",
+            "Request intent normalized.",
+            {
+                "raw_prompt": intent.raw_prompt,
+                "symbols_requested": intent.symbols_requested,
+                "request_mode": intent.request_mode.value,
+                "risk_preference": intent.risk_preference.value,
+                "time_horizon": intent.time_horizon.value,
+                "bias_override_refused": intent.bias_override_refused,
+                "parser_confidence": intent.parser_confidence,
+                "extraction_method": intent.extraction_method,
+            },
+        )
+        return intent
+
+    def _execute_request(self, request_id: str, runner) -> None:
+        try:
+            runner()
+        except Exception as exc:
+            self.storage.update_request(
+                request_id,
+                status=SignalStatus.FAILED,
+                errors=[str(exc)],
+            )
+            self.storage.add_audit_log(
+                request_id,
+                "pipeline_failed",
+                "Analysis execution failed.",
+                {"error": str(exc)},
+            )
+            self.storage.add_event(request_id, "pipeline_failed", {"error": str(exc)})
+
     def close(self) -> None:
         self.graph_service.close()
 
@@ -100,26 +138,20 @@ class AppServices:
         }
 
     def generate(self, payload: GenerateSignalRequest) -> GenerateSignalResponse:
-        intent = self.intent_parser.parse(payload)
-        self.storage.create_request(intent.request_id, intent)
-        self.storage.add_audit_log(
-            intent.request_id,
-            "intent_parsed",
-            "Request intent normalized.",
-            {
-                "raw_prompt": intent.raw_prompt,
-                "symbols_requested": intent.symbols_requested,
-                "request_mode": intent.request_mode.value,
-                "risk_preference": intent.risk_preference.value,
-                "time_horizon": intent.time_horizon.value,
-                "bias_override_refused": intent.bias_override_refused,
-                "parser_confidence": intent.parser_confidence,
-                "extraction_method": intent.extraction_method,
-            },
-        )
-        self.graph_service.start(intent)
+        intent = self._prepare_request(payload)
+        self._execute_request(intent.request_id, lambda: self.graph_service.start(intent))
         record = self.storage.get_signal_record(intent.request_id)
         return GenerateSignalResponse(request_id=intent.request_id, status=record.status if record else SignalStatus.FAILED)
+
+    def generate_live(self, payload: GenerateSignalRequest) -> GenerateSignalResponse:
+        intent = self._prepare_request(payload)
+        thread = threading.Thread(
+            target=self._execute_request,
+            args=(intent.request_id, lambda: self.graph_service.start(intent)),
+            daemon=True,
+        )
+        thread.start()
+        return GenerateSignalResponse(request_id=intent.request_id, status=SignalStatus.RUNNING)
 
     def get_signal(self, request_id: str) -> SignalRecord:
         record = self.storage.get_signal_record(request_id)
@@ -177,6 +209,9 @@ class AppServices:
 
     def stream_events(self, request_id: str) -> list[dict]:
         return self.storage.get_events(request_id)
+
+    def stream_events_after(self, request_id: str, after_id: int = 0) -> list[dict]:
+        return self.storage.get_events_after(request_id, after_id)
 
     def export_signal_detail(self, request_id: str) -> dict:
         record = self.get_signal(request_id)

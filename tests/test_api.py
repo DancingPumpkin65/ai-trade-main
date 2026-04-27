@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -116,6 +117,38 @@ def test_generate_universe_scan(tmp_path: Path, monkeypatch):
     assert payload["request_intent"]["request_mode"] == "UNIVERSE_SCAN"
     assert "opportunity_list" in payload
     assert "universe_scan_candidates" in payload
+
+
+def test_live_generate_stream_starts_request_and_emits_pipeline_events(tmp_path: Path, monkeypatch):
+    _configure_env(tmp_path, monkeypatch)
+
+    client = TestClient(app)
+    seen_events: list[tuple[str, dict]] = []
+    current_event: str | None = None
+
+    with client.stream("GET", "/signals/generate/stream", params={"prompt": "Analyze ATW with conservative risk"}) as response:
+        assert response.status_code == 200
+        for line in response.iter_lines():
+            if not line:
+                continue
+            if line.startswith("event:"):
+                current_event = line.split(":", 1)[1].strip()
+            elif line.startswith("data:") and current_event:
+                payload = json.loads(line.split(":", 1)[1].strip())
+                seen_events.append((current_event, payload))
+                if current_event == "pipeline_complete":
+                    break
+
+    event_names = [event_name for event_name, _ in seen_events]
+    assert "request_started" in event_names
+    assert "pipeline_start" in event_names
+    assert "pipeline_complete" in event_names
+
+    request_started_payload = next(payload for event_name, payload in seen_events if event_name == "request_started")
+    request_id = request_started_payload["request_id"]
+    detail = client.get(f"/signals/{request_id}")
+    assert detail.status_code == 200
+    assert detail.json()["signal_status"] == "COMPLETED"
 
 
 def test_order_approval_flow_marks_prepared_preview_as_approved(tmp_path: Path, monkeypatch):

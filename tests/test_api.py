@@ -587,3 +587,118 @@ def test_universe_scan_candidates_are_persisted_with_ranking_statuses(tmp_path: 
         if candidate["rank_position"] is not None
     ]
     assert ranked_positions == sorted(ranked_positions)
+
+
+def test_universe_opportunity_order_flow_is_scoped_per_symbol(tmp_path: Path, monkeypatch):
+    _configure_env(tmp_path, monkeypatch)
+    client = TestClient(app)
+    services = get_services()
+    services.graph_service.alpaca_preview_service.register_symbol_mapping("ATW", "SPY")
+
+    strong = _trend_stock("ATW", "Attijariwafa Bank", last_volume=2_400_000.0, step=1.7)
+    weak = _trend_stock("IAM", "Maroc Telecom", last_volume=500_000.0, step=0.1)
+
+    async def fake_ingest_news(symbol=None):
+        return None
+
+    async def fake_list_stocks():
+        return [strong, weak]
+
+    async def fake_get_stock(symbol: str):
+        return {"ATW": strong, "IAM": weak}[symbol.upper()]
+
+    def fake_search_news(query, top_k=8, filters=None, metadata=None):
+        if "ATW" in query:
+            return [
+                NewsChunk(
+                    chunk_id="atw-1",
+                    text="ATW annonce un dividende et une hausse de resultat.",
+                    source="Casablanca Bourse PDF",
+                    published_at=datetime.now(timezone.utc) - timedelta(days=1),
+                    similarity_score=0.95,
+                    url="https://example.com/atw-1",
+                    metadata={"doc_type": "corporate_notices", "ticker": "ATW"},
+                )
+            ]
+        return []
+
+    services.graph_service.ingest_news = fake_ingest_news
+    services.graph_service.drahmi_client.list_stocks = fake_list_stocks
+    services.graph_service.drahmi_client.get_stock = fake_get_stock
+    services.graph_service.retriever.search_news = fake_search_news
+
+    response = client.post("/signals/generate", json={"prompt": "I have 100,000 MAD. What are the best possible trades this week?"})
+    assert response.status_code == 200
+    request_id = response.json()["request_id"]
+
+    detail = client.get(f"/signals/{request_id}")
+    assert detail.status_code == 200
+    payload = detail.json()
+    assert payload["opportunity_list"]["top_opportunities"]
+    assert payload["opportunity_alpaca_orders"] == {}
+
+    opportunity_order = client.get(f"/signals/{request_id}/opportunities/ATW/alpaca-order")
+    assert opportunity_order.status_code == 200
+    order_payload = opportunity_order.json()
+    assert order_payload["symbol"] == "ATW"
+    assert order_payload["alpaca_order_status"] == "PREPARED"
+    assert order_payload["order_approval_required"] is True
+
+    approved = client.post(f"/signals/{request_id}/opportunities/ATW/approve")
+    assert approved.status_code == 200
+    approved_payload = approved.json()
+    assert approved_payload["alpaca_order_status"] == "APPROVED"
+    assert approved_payload["order_approval_required"] is False
+
+    refreshed_detail = client.get(f"/signals/{request_id}")
+    assert refreshed_detail.status_code == 200
+    refreshed_payload = refreshed_detail.json()
+    assert refreshed_payload["opportunity_alpaca_orders"]["ATW"]["status"] == "APPROVED"
+
+
+def test_universe_opportunity_order_is_unmappable_without_mapping(tmp_path: Path, monkeypatch):
+    _configure_env(tmp_path, monkeypatch)
+    client = TestClient(app)
+    services = get_services()
+
+    strong = _trend_stock("ATW", "Attijariwafa Bank", last_volume=2_400_000.0, step=1.7)
+
+    async def fake_ingest_news(symbol=None):
+        return None
+
+    async def fake_list_stocks():
+        return [strong]
+
+    async def fake_get_stock(symbol: str):
+        return strong
+
+    def fake_search_news(query, top_k=8, filters=None, metadata=None):
+        return [
+            NewsChunk(
+                chunk_id="atw-1",
+                text="ATW annonce un dividende et une hausse de resultat.",
+                source="Casablanca Bourse PDF",
+                published_at=datetime.now(timezone.utc) - timedelta(days=1),
+                similarity_score=0.95,
+                url="https://example.com/atw-1",
+                metadata={"doc_type": "corporate_notices", "ticker": "ATW"},
+            )
+        ]
+
+    services.graph_service.ingest_news = fake_ingest_news
+    services.graph_service.drahmi_client.list_stocks = fake_list_stocks
+    services.graph_service.drahmi_client.get_stock = fake_get_stock
+    services.graph_service.retriever.search_news = fake_search_news
+
+    response = client.post("/signals/generate", json={"prompt": "Best trades this week"})
+    assert response.status_code == 200
+    request_id = response.json()["request_id"]
+
+    opportunity_order = client.get(f"/signals/{request_id}/opportunities/ATW/alpaca-order")
+    assert opportunity_order.status_code == 200
+    payload = opportunity_order.json()
+    assert payload["alpaca_order_status"] == "UNMAPPABLE"
+    assert payload["order_approval_required"] is False
+
+    approved = client.post(f"/signals/{request_id}/opportunities/ATW/approve")
+    assert approved.status_code == 400

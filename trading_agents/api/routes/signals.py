@@ -121,3 +121,30 @@ def get_alpaca_order(request_id: str):
         return services.get_alpaca_order(request_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/{request_id}/opportunities/{symbol}/alpaca-order")
+def get_opportunity_alpaca_order(request_id: str, symbol: str):
+    services = get_services()
+    try:
+        return services.get_universe_opportunity_alpaca_order(request_id, symbol)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/{request_id}/opportunities/{symbol}/approve")
+def approve_opportunity(request_id: str, symbol: str):
+    services = get_services()
+    try:
+        return services.approve_universe_opportunity(request_id, symbol)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/{request_id}/opportunities/{symbol}/reject")
+def reject_opportunity(request_id: str, symbol: str):
+    services = get_services()
+    try:
+        return services.reject_universe_opportunity(request_id, symbol)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

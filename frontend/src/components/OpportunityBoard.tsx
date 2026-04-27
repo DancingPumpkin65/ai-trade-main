@@ -1,13 +1,46 @@
-import type { TradeOpportunityList, UniverseScanCandidateRecord } from "../lib/types";
+import { useState, useTransition } from "react";
+
+import type { AlpacaOrderIntent, TradeOpportunityList, UniverseScanCandidateRecord } from "../lib/types";
 import { formatCurrency, formatPercent } from "../lib/utils";
 import { StatusBadge } from "./StatusBadge";
 
 interface OpportunityBoardProps {
+  requestId: string;
   opportunityList: TradeOpportunityList;
   candidates: UniverseScanCandidateRecord[];
+  opportunityOrders: Record<string, AlpacaOrderIntent>;
+  onLoadOrder: (symbol: string) => Promise<void>;
+  onApproveOrder: (symbol: string) => Promise<void>;
+  onRejectOrder: (symbol: string) => Promise<void>;
 }
 
-export function OpportunityBoard({ opportunityList, candidates }: OpportunityBoardProps) {
+export function OpportunityBoard({
+  requestId,
+  opportunityList,
+  candidates,
+  opportunityOrders,
+  onLoadOrder,
+  onApproveOrder,
+  onRejectOrder,
+}: OpportunityBoardProps) {
+  const [busySymbol, setBusySymbol] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [isPending, startTransition] = useTransition();
+
+  function run(symbol: string, action: (targetSymbol: string) => Promise<void>) {
+    setError(null);
+    setBusySymbol(symbol);
+    startTransition(() => {
+      void action(symbol)
+        .catch((nextError) => {
+          setError(nextError instanceof Error ? nextError.message : "Opportunity order action failed.");
+        })
+        .finally(() => {
+          setBusySymbol(null);
+        });
+    });
+  }
+
   return (
     <div className="stack">
       <section className="panel">
@@ -43,9 +76,59 @@ export function OpportunityBoard({ opportunityList, candidates }: OpportunityBoa
                   <dd>{opportunity.signal.risk_score.toFixed(2)}</dd>
                 </div>
               </dl>
+              <div className="opportunity-order-box">
+                <div className="opportunity-order-head">
+                  <strong>Broker command</strong>
+                  {opportunityOrders[opportunity.signal.symbol] ? (
+                    <StatusBadge value={opportunityOrders[opportunity.signal.symbol].status} />
+                  ) : (
+                    <span className="order-placeholder">Not prepared</span>
+                  )}
+                </div>
+                {opportunityOrders[opportunity.signal.symbol]?.reason ? (
+                  <p className="support-copy">
+                    {opportunityOrders[opportunity.signal.symbol].reason}
+                  </p>
+                ) : null}
+                <div className="action-row">
+                  {!opportunityOrders[opportunity.signal.symbol] ? (
+                    <button
+                      className="ghost-button"
+                      disabled={isPending && busySymbol === opportunity.signal.symbol}
+                      onClick={() => run(opportunity.signal.symbol, onLoadOrder)}
+                      type="button"
+                    >
+                      Prepare preview
+                    </button>
+                  ) : null}
+                  {opportunityOrders[opportunity.signal.symbol]?.status === "PREPARED" ? (
+                    <>
+                      <button
+                        className="primary-button"
+                        disabled={isPending && busySymbol === opportunity.signal.symbol}
+                        onClick={() => run(opportunity.signal.symbol, onApproveOrder)}
+                        type="button"
+                      >
+                        Approve
+                      </button>
+                      <button
+                        className="danger-button"
+                        disabled={isPending && busySymbol === opportunity.signal.symbol}
+                        onClick={() => run(opportunity.signal.symbol, onRejectOrder)}
+                        type="button"
+                      >
+                        Reject
+                      </button>
+                    </>
+                  ) : null}
+                </div>
+              </div>
             </article>
           ))}
         </div>
+
+        {error ? <p className="inline-error">{error}</p> : null}
+        <p className="micro-copy">Universe request: {requestId}</p>
 
         {opportunityList.rejected_candidates_summary.length > 0 ? (
           <div className="alert-strip">

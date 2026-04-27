@@ -4,6 +4,7 @@ import type {
   GenerateSignalRequest,
   GenerateSignalResponse,
   HealthResponse,
+  OpportunityAlpacaOrderEnvelope,
   SignalDetailResponse,
   SignalEvent,
   SignalRecord,
@@ -65,6 +66,21 @@ export const api = {
   },
   alpacaOrder(requestId: string) {
     return request<AlpacaOrderEnvelope>(`/signals/${requestId}/alpaca-order`, { method: "GET" });
+  },
+  universeOpportunityAlpacaOrder(requestId: string, symbol: string) {
+    return request<OpportunityAlpacaOrderEnvelope>(`/signals/${requestId}/opportunities/${symbol}/alpaca-order`, {
+      method: "GET",
+    });
+  },
+  approveUniverseOpportunity(requestId: string, symbol: string) {
+    return request<OpportunityAlpacaOrderEnvelope>(`/signals/${requestId}/opportunities/${symbol}/approve`, {
+      method: "POST",
+    });
+  },
+  rejectUniverseOpportunity(requestId: string, symbol: string) {
+    return request<OpportunityAlpacaOrderEnvelope>(`/signals/${requestId}/opportunities/${symbol}/reject`, {
+      method: "POST",
+    });
   },
   register(username: string, password: string) {
     return request<{ username: string }>("/auth/register", {

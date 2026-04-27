@@ -68,6 +68,21 @@ export function SignalDetailPage() {
     await load();
   }
 
+  async function loadOpportunityOrder(symbol: string) {
+    await api.universeOpportunityAlpacaOrder(requestId, symbol);
+    await load();
+  }
+
+  async function approveOpportunityOrder(symbol: string) {
+    await api.approveUniverseOpportunity(requestId, symbol);
+    await load();
+  }
+
+  async function rejectOpportunityOrder(symbol: string) {
+    await api.rejectUniverseOpportunity(requestId, symbol);
+    await load();
+  }
+
   if (!requestId) {
     return (
       <section className="panel empty-panel">
@@ -197,8 +212,13 @@ export function SignalDetailPage() {
 
       {detail?.opportunity_list ? (
         <OpportunityBoard
+          requestId={requestId}
           candidates={detail.universe_scan_candidates}
           opportunityList={detail.opportunity_list}
+          opportunityOrders={detail.opportunity_alpaca_orders}
+          onLoadOrder={loadOpportunityOrder}
+          onApproveOrder={approveOpportunityOrder}
+          onRejectOrder={rejectOpportunityOrder}
         />
       ) : null}
 

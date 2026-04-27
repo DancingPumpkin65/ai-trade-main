@@ -123,6 +123,7 @@ export interface SignalDetailResponse extends SignalRecord {
   order_approval_required: boolean;
   analysis_warnings: string[];
   universe_scan_candidates: UniverseScanCandidateRecord[];
+  opportunity_alpaca_orders: Record<string, AlpacaOrderIntent>;
 }
 
 export interface GenerateSignalRequest {
@@ -166,4 +167,8 @@ export interface AlpacaOrderEnvelope {
   alpaca_order_status: AlpacaOrderStatus;
   order_approval_required: boolean;
   alpaca_order: AlpacaOrderIntent | null;
+}
+
+export interface OpportunityAlpacaOrderEnvelope extends AlpacaOrderEnvelope {
+  symbol: string;
 }

@@ -51,16 +51,12 @@ def run_scenario(scenario: HarnessScenario) -> ScenarioArtifact:
             response = services.generate(scenario.request)
             initial_detail = services.export_signal_detail(response.request_id)
             final_detail = initial_detail
-            if scenario.approval_decision == "approve" and initial_detail["signal_status"] == "WAITING_HUMAN":
-                final_detail = services.approve(response.request_id).model_dump(mode="json")
-                final_detail["signal_status"] = final_detail["status"]
-                final_detail["human_review_required"] = final_detail["human_review_required"]
-                final_detail["alpaca_order_status"] = final_detail["alpaca_order_status"]
-            elif scenario.approval_decision == "reject" and initial_detail["signal_status"] == "WAITING_HUMAN":
-                final_detail = services.reject(response.request_id).model_dump(mode="json")
-                final_detail["signal_status"] = final_detail["status"]
-                final_detail["human_review_required"] = final_detail["human_review_required"]
-                final_detail["alpaca_order_status"] = final_detail["alpaca_order_status"]
+            if scenario.approval_decision == "approve" and initial_detail.get("order_approval_required"):
+                services.approve(response.request_id)
+                final_detail = services.export_signal_detail(response.request_id)
+            elif scenario.approval_decision == "reject" and initial_detail.get("order_approval_required"):
+                services.reject(response.request_id)
+                final_detail = services.export_signal_detail(response.request_id)
             else:
                 final_detail = services.export_signal_detail(response.request_id)
             events = services.stream_events(response.request_id)

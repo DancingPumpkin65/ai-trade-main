@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from trading_agents.core.models import NewsChunk, StockInfo
+from trading_agents.core.models import NewsChunk, RiskOutput, StockInfo
 
 
 def _trend_stock(
@@ -205,6 +205,8 @@ def install_fixture(services, fixture_name: str) -> None:
 
     if fixture_name == "high_risk_review":
         stock = _volatile_stock("ATW")
+        services.alpaca_preview_service.register_symbol_mapping("ATW", "SPY")
+        services.graph_service.alpaca_preview_service.register_symbol_mapping("ATW", "SPY")
 
         async def get_stock(symbol: str):
             return stock
@@ -212,8 +214,27 @@ def install_fixture(services, fixture_name: str) -> None:
         def search_news(query: str, top_k: int = 5, filters=None, metadata=None):
             return _positive_chunks("ATW", "Attijariwafa Bank", now)
 
+        def forced_risk_loop(*, request_id: str, symbol: str, capital: float, request_intent, scratchpad: list[dict]):
+            messages = list(scratchpad)
+            messages.append({"role": "assistant", "content": "Forced risk output for harness order-approval scenario."})
+            return (
+                RiskOutput(
+                    action="BUY",
+                    position_size_pct=0.03,
+                    position_value_mad=capital * 0.03,
+                    stop_loss_pct=0.08,
+                    take_profit_pct=0.12,
+                    risk_score=0.72,
+                    volatility_estimate=0.65,
+                    rationale="Forced BUY risk output for harness order-approval scenario.",
+                ),
+                messages,
+                [],
+            )
+
         services.drahmi_client.get_stock = get_stock
         services.graph_service.retriever.search_news = search_news
+        services.graph_service._run_risk_loop = forced_risk_loop
         return
 
     raise ValueError(f"Unknown harness fixture: {fixture_name}")

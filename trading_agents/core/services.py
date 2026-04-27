@@ -62,7 +62,12 @@ class AppServices:
             ),
             tracer=intent_tracer,
         )
-        self.alpaca_preview_service = AlpacaPreviewService(enabled=settings.alpaca_enabled)
+        self.alpaca_preview_service = AlpacaPreviewService(
+            enabled=settings.alpaca_enabled,
+            api_key_id=settings.alpaca_api_key_id,
+            api_secret_key=settings.alpaca_api_secret_key,
+            base_url=settings.alpaca_base_url,
+        )
         self.drahmi_client = DrahmiClient(settings.drahmi_base_url, settings.drahmi_api_key, settings.drahmi_daily_limit)
         self.morocco_news_client = MoroccoNewsClient()
         self.marketaux_client = MarketAuxClient(settings.marketaux_base_url, settings.marketaux_api_key)
@@ -204,6 +209,94 @@ class AppServices:
         self.storage.add_event(request_id, "alpaca_order_rejected", rejected_order.model_dump(mode="json"))
         return self.get_signal(request_id)
 
+    def _get_universe_opportunity(self, request_id: str, symbol: str):
+        record = self.get_signal(request_id)
+        if record.opportunity_list is None:
+            raise ValueError("This request does not contain universe-scan opportunities.")
+        for opportunity in record.opportunity_list.top_opportunities:
+            if opportunity.signal.symbol.upper() == symbol.upper():
+                return opportunity
+        raise ValueError(f"No ranked opportunity exists for symbol '{symbol.upper()}'.")
+
+    def _prepare_universe_opportunity_order(self, request_id: str, symbol: str):
+        existing = self.storage.get_opportunity_alpaca_order(request_id, symbol)
+        if existing is not None:
+            return existing
+
+        opportunity = self._get_universe_opportunity(request_id, symbol)
+        order = self.alpaca_preview_service.prepare_preview(opportunity.signal)
+        event_type = "opportunity_alpaca_preview_prepared"
+        if order.status == AlpacaOrderStatus.PREPARED and not self.settings.alpaca_require_order_approval:
+            order = self.alpaca_preview_service.approve_preview(
+                order,
+                submission_enabled=self.settings.alpaca_submit_orders,
+            )
+            event_type = "opportunity_alpaca_order_auto_approved"
+        self.storage.upsert_opportunity_alpaca_order(request_id, symbol, order)
+        self.storage.add_event(
+            request_id,
+            event_type,
+            {"symbol": symbol.upper(), "alpaca_order": order.model_dump(mode="json")},
+        )
+        self.storage.add_audit_log(
+            request_id,
+            "opportunity_order_prepared",
+            "Universe opportunity Alpaca preview prepared.",
+            {"symbol": symbol.upper(), "alpaca_order_status": order.status.value},
+        )
+        return order
+
+    def get_universe_opportunity_alpaca_order(self, request_id: str, symbol: str) -> dict:
+        order = self._prepare_universe_opportunity_order(request_id, symbol)
+        return {
+            "request_id": request_id,
+            "symbol": symbol.upper(),
+            "alpaca_order_status": order.status.value,
+            "order_approval_required": order.status.value == "PREPARED",
+            "alpaca_order": order.model_dump(mode="json"),
+        }
+
+    def approve_universe_opportunity(self, request_id: str, symbol: str) -> dict:
+        order = self._prepare_universe_opportunity_order(request_id, symbol)
+        if order.status != AlpacaOrderStatus.PREPARED:
+            raise ValueError("No prepared Alpaca order preview is available for this opportunity.")
+        approved_order = self.alpaca_preview_service.approve_preview(
+            order,
+            submission_enabled=self.settings.alpaca_submit_orders,
+        )
+        self.storage.upsert_opportunity_alpaca_order(request_id, symbol, approved_order)
+        self.storage.add_audit_log(
+            request_id,
+            "opportunity_order_approval",
+            "Operator approved a universe opportunity Alpaca command.",
+            {"symbol": symbol.upper(), "decision": "approved", "alpaca_order_status": approved_order.status.value},
+        )
+        self.storage.add_event(
+            request_id,
+            "opportunity_alpaca_order_approved",
+            {"symbol": symbol.upper(), "alpaca_order": approved_order.model_dump(mode="json")},
+        )
+        return self.get_universe_opportunity_alpaca_order(request_id, symbol)
+
+    def reject_universe_opportunity(self, request_id: str, symbol: str) -> dict:
+        order = self._prepare_universe_opportunity_order(request_id, symbol)
+        if order.status != AlpacaOrderStatus.PREPARED:
+            raise ValueError("No prepared Alpaca order preview is available for this opportunity.")
+        rejected_order = self.alpaca_preview_service.reject_preview(order)
+        self.storage.upsert_opportunity_alpaca_order(request_id, symbol, rejected_order)
+        self.storage.add_audit_log(
+            request_id,
+            "opportunity_order_approval",
+            "Operator rejected a universe opportunity Alpaca command.",
+            {"symbol": symbol.upper(), "decision": "rejected", "alpaca_order_status": rejected_order.status.value},
+        )
+        self.storage.add_event(
+            request_id,
+            "opportunity_alpaca_order_rejected",
+            {"symbol": symbol.upper(), "alpaca_order": rejected_order.model_dump(mode="json")},
+        )
+        return self.get_universe_opportunity_alpaca_order(request_id, symbol)
+
     def history(self) -> list[SignalRecord]:
         return self.storage.list_history()
 
@@ -226,6 +319,10 @@ class AppServices:
             candidate.model_dump(mode="json")
             for candidate in self.storage.get_universe_scan_candidates(request_id)
         ]
+        payload["opportunity_alpaca_orders"] = {
+            symbol: order.model_dump(mode="json")
+            for symbol, order in self.storage.list_opportunity_alpaca_orders(request_id).items()
+        }
         return payload
 
     def get_alpaca_order(self, request_id: str) -> dict:

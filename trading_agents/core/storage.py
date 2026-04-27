@@ -103,6 +103,17 @@ class Storage:
                     rejection_reason TEXT,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS opportunity_alpaca_orders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    alpaca_order_json TEXT NOT NULL,
+                    alpaca_order_status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(request_id, symbol)
+                );
                 """
             )
 
@@ -299,6 +310,64 @@ class Storage:
         if row is None or not row["state_json"]:
             return None
         return json.loads(row["state_json"])
+
+    def upsert_opportunity_alpaca_order(
+        self,
+        request_id: str,
+        symbol: str,
+        order: AlpacaOrderIntent,
+    ) -> None:
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with self.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO opportunity_alpaca_orders (
+                    request_id, symbol, alpaca_order_json, alpaca_order_status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(request_id, symbol) DO UPDATE SET
+                    alpaca_order_json = excluded.alpaca_order_json,
+                    alpaca_order_status = excluded.alpaca_order_status,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    request_id,
+                    symbol.upper(),
+                    json.dumps(order.model_dump(mode="json"), default=_json_default),
+                    order.status.value,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+
+    def get_opportunity_alpaca_order(self, request_id: str, symbol: str) -> AlpacaOrderIntent | None:
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT alpaca_order_json
+                FROM opportunity_alpaca_orders
+                WHERE request_id = ? AND symbol = ?
+                """,
+                (request_id, symbol.upper()),
+            ).fetchone()
+        if row is None:
+            return None
+        return AlpacaOrderIntent.model_validate_json(row["alpaca_order_json"])
+
+    def list_opportunity_alpaca_orders(self, request_id: str) -> dict[str, AlpacaOrderIntent]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT symbol, alpaca_order_json
+                FROM opportunity_alpaca_orders
+                WHERE request_id = ?
+                ORDER BY symbol ASC
+                """,
+                (request_id,),
+            ).fetchall()
+        return {
+            row["symbol"]: AlpacaOrderIntent.model_validate_json(row["alpaca_order_json"])
+            for row in rows
+        }
 
     def replace_universe_scan_candidates(self, request_id: str, candidates: list[UniverseScanCandidateRecord]) -> None:
         timestamp = datetime.now(timezone.utc).isoformat()

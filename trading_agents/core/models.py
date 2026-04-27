@@ -49,6 +49,8 @@ class SignalStatus(str, Enum):
 class AlpacaOrderStatus(str, Enum):
     NOT_PREPARED = "NOT_PREPARED"
     PREPARED = "PREPARED"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
     UNMAPPABLE = "UNMAPPABLE"
 
 

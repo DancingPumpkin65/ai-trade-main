@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from operator import add
-from typing import Annotated, Literal, TypedDict
+from typing import Annotated, TypedDict
 
 from trading_agents.core.models import (
     CoordinatorOutput,
@@ -37,7 +37,6 @@ class GraphState(TypedDict):
     risk_messages: list[dict]
     coordinator_messages: list[dict]
     technical_retry_count: int
-    human_review_required: bool
-    human_review_decision: Literal["approved", "rejected"] | None
+    analysis_warning_reasons: list[str]
     started_at: datetime
     errors: Annotated[list[str], add]

@@ -49,3 +49,28 @@ class AlpacaPreviewService:
             status=AlpacaOrderStatus.PREPARED,
             created_at=datetime.now(timezone.utc),
         )
+
+    def approve_preview(self, order: AlpacaOrderIntent, *, submission_enabled: bool) -> AlpacaOrderIntent:
+        if order.status != AlpacaOrderStatus.PREPARED:
+            raise ValueError("Only prepared Alpaca previews can be approved.")
+        reason = order.reason
+        if not submission_enabled:
+            reason = "Operator approved the order command, but broker submission remains disabled by configuration."
+        return order.model_copy(
+            update={
+                "status": AlpacaOrderStatus.APPROVED,
+                "submission_eligible": bool(submission_enabled),
+                "reason": reason,
+            }
+        )
+
+    def reject_preview(self, order: AlpacaOrderIntent) -> AlpacaOrderIntent:
+        if order.status != AlpacaOrderStatus.PREPARED:
+            raise ValueError("Only prepared Alpaca previews can be rejected.")
+        return order.model_copy(
+            update={
+                "status": AlpacaOrderStatus.REJECTED,
+                "submission_eligible": False,
+                "reason": "Operator rejected the Alpaca order command.",
+            }
+        )

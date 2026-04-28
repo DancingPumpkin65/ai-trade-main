@@ -75,6 +75,7 @@ def test_migration_cli_reports_current_version(tmp_path: Path, monkeypatch):
     )
     payload = json.loads(result.stdout)
 
-    assert payload["db_path"] == str(db_path)
+    assert payload["database_backend"] == "sqlite"
+    assert payload["database_target"] == str(db_path)
     assert payload["current_version"] == len(MIGRATIONS)
     assert payload["applied_migrations"]

@@ -103,7 +103,7 @@ class DrahmiClient:
         )
         return stock
 
-    def _payload_to_stock(self, payload: dict, *, context: str) -> StockInfo:
+    def _payload_to_stock(self, payload: dict, *, context: str = "Drahmi stock payload") -> StockInfo:
         if not isinstance(payload, dict):
             raise DrahmiSchemaError(f"{context} must be an object.")
         symbol = self._require_string(payload, ("ticker", "symbol"), context=context, label="symbol")

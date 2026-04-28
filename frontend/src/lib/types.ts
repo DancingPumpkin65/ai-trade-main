@@ -150,7 +150,9 @@ export interface AuthResponse {
 
 export interface HealthResponse {
   status: string;
-  db_path: string;
+  db_backend: string;
+  db_target: string;
+  schema_version: number;
   langgraph_checkpoint_path: string;
   langsmith_tracing: boolean;
   alpaca_enabled: boolean;

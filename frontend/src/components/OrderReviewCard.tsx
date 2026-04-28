@@ -54,7 +54,15 @@ export function OrderReviewCard({ status, order, onApprove, onReject }: OrderRev
           </div>
           <div>
             <dt>Submission mode</dt>
-            <dd>{order.submission_eligible ? "Live submit allowed" : "Preview only"}</dd>
+            <dd>
+              {order.preview_only
+                ? "Preview only"
+                : `${order.broker_submission_mode ?? "broker"} submit · ${order.broker_order_status ?? "submitted"}`}
+            </dd>
+          </div>
+          <div>
+            <dt>Broker order id</dt>
+            <dd>{order.broker_order_id ?? "—"}</dd>
           </div>
           <div>
             <dt>Reason</dt>

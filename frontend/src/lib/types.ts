@@ -91,6 +91,10 @@ export interface AlpacaOrderIntent {
   submission_eligible: boolean;
   status: AlpacaOrderStatus;
   reason: string | null;
+  broker_order_id?: string | null;
+  broker_order_status?: string | null;
+  broker_submission_mode?: string | null;
+  submitted_at?: string | null;
   created_at: string;
 }
 
@@ -152,6 +156,7 @@ export interface HealthResponse {
   alpaca_enabled: boolean;
   alpaca_require_order_approval: boolean;
   alpaca_submit_orders: boolean;
+  alpaca_submission_mode: string;
   langgraph_enabled: boolean;
   rag_backend: string;
   bourse_cache_dir: string;

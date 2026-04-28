@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from trading_agents.core.llm import get_default_agent_llm
 from trading_agents.core.models import TechnicalOutput
 from trading_agents.graph.helpers import analyze_technical_features
 
 
-def run_technical_agent(stock_info, mismatch_feedback: str | None = None) -> tuple[TechnicalOutput, dict]:
+def _deterministic_technical_output(stock_info, mismatch_feedback: str | None = None) -> tuple[TechnicalOutput, dict]:
     features = analyze_technical_features(stock_info)
     trend_summary = (
         "Tendance haussière confirmée par EMA10 au-dessus de SMA20."
@@ -31,3 +32,46 @@ def run_technical_agent(stock_info, mismatch_feedback: str | None = None) -> tup
         confidence=0.72,
     )
     return output, features.model_dump()
+
+
+def run_technical_agent(stock_info, mismatch_feedback: str | None = None) -> tuple[TechnicalOutput, dict]:
+    deterministic_output, features = _deterministic_technical_output(
+        stock_info,
+        mismatch_feedback=mismatch_feedback,
+    )
+    llm = get_default_agent_llm()
+    if llm is None:
+        return deterministic_output, features
+
+    llm_output = llm.generate_structured(
+        agent_name="technical",
+        system_prompt=(
+            "Summarize technical posture from the supplied computed indicators only. "
+            "Do not invent indicators or price history. "
+            "Return concise French summaries and a directional bias."
+        ),
+        context={
+            "symbol": stock_info.symbol,
+            "stock": {
+                "name": stock_info.name,
+                "last_price": stock_info.last_price,
+                "last_volume": stock_info.last_volume,
+            },
+            "technical_features": features,
+            "mismatch_feedback": mismatch_feedback,
+            "deterministic_baseline": deterministic_output.model_dump(mode="json"),
+        },
+        response_model=TechnicalOutput,
+    )
+    if llm_output is None:
+        return deterministic_output, features
+
+    output = llm_output.model_copy(
+        update={
+            "support_levels": features["support_levels"],
+            "resistance_levels": features["resistance_levels"],
+            "volatility_estimate": features["annualized_volatility"],
+            "confidence": round(max(0.0, min(1.0, llm_output.confidence)), 4),
+        }
+    )
+    return output, features

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from trading_agents.core.intent.policy import IntentPolicyEngine
+from trading_agents.core.llm import get_default_agent_llm
 from trading_agents.core.models import CoordinatorOutput, IntentAlignment, RequestIntent, UserBias
 
 
-def run_coordinator_agent(
+def _deterministic_coordinator_output(
     *,
     symbol: str,
     request_intent: RequestIntent,
@@ -68,4 +69,57 @@ def run_coordinator_agent(
         confidence=round((sentiment_output.confidence + technical_output.confidence) / 2, 4),
         intent_alignment=alignment,
         preference_conflicts=preference_conflicts,
+    )
+
+
+def run_coordinator_agent(
+    *,
+    symbol: str,
+    request_intent: RequestIntent,
+    sentiment_output,
+    technical_output,
+    risk_output,
+    policy_context: dict | None = None,
+) -> CoordinatorOutput:
+    deterministic = _deterministic_coordinator_output(
+        symbol=symbol,
+        request_intent=request_intent,
+        sentiment_output=sentiment_output,
+        technical_output=technical_output,
+        risk_output=risk_output,
+        policy_context=policy_context,
+    )
+    llm = get_default_agent_llm()
+    if llm is None:
+        return deterministic
+
+    llm_output = llm.generate_structured(
+        agent_name="coordinator",
+        system_prompt=(
+            "Produce the final French coordinator summary for a Morocco trading workflow. "
+            "Respect the supplied risk action as the final action. "
+            "Clearly distinguish user preference from system conclusion when they diverge."
+        ),
+        context={
+            "symbol": symbol,
+            "request_intent": request_intent.model_dump(mode="json"),
+            "policy_context": policy_context,
+            "sentiment_output": sentiment_output.model_dump(mode="json"),
+            "technical_output": technical_output.model_dump(mode="json"),
+            "risk_output": risk_output.model_dump(mode="json"),
+            "deterministic_baseline": deterministic.model_dump(mode="json"),
+        },
+        response_model=CoordinatorOutput,
+    )
+    if llm_output is None:
+        return deterministic
+
+    return deterministic.model_copy(
+        update={
+            "rationale_fr": llm_output.rationale_fr or deterministic.rationale_fr,
+            "dissenting_views": llm_output.dissenting_views or deterministic.dissenting_views,
+            "confidence": round(max(0.0, min(1.0, llm_output.confidence)), 4),
+            "intent_alignment": llm_output.intent_alignment,
+            "preference_conflicts": llm_output.preference_conflicts or deterministic.preference_conflicts,
+        }
     )

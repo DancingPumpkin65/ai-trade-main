@@ -29,6 +29,9 @@ dev = [
   "pytest>=8.3.0",
   "pytest-asyncio>=0.24.0",
 ]
+postgres = [
+  "psycopg[binary]>=3.2.0",
+]
 integrations = [
   "langgraph>=0.2.50",
   "langgraph-checkpoint-sqlite>=3.0.0",

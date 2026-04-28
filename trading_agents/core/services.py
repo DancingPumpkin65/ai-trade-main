@@ -85,7 +85,7 @@ class ServiceRequestError(Exception):
 class AppServices:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.storage = Storage(settings.db_path)
+        self.storage = Storage(settings.db_path, settings.database_url)
         intent_tracer = LangSmithIntentTracer(
             enabled=settings.langsmith_tracing,
             project_name=settings.langsmith_project,
@@ -200,7 +200,8 @@ class AppServices:
     def health(self) -> dict:
         return {
             "status": "ok",
-            "db_path": str(self.settings.db_path),
+            "db_backend": self.storage.backend_name,
+            "db_target": self.settings.database_url or str(self.settings.db_path),
             "schema_version": self.storage.schema_version,
             "langgraph_checkpoint_path": str(self.settings.langgraph_checkpoint_path),
             "langsmith_tracing": self.settings.langsmith_tracing,

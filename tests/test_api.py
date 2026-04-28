@@ -7,6 +7,7 @@ import httpx
 
 from trading_agents.api.deps import get_services
 from trading_agents.api.main import app
+from trading_agents.core.data.drahmi import DrahmiAuthError, DrahmiNotFoundError, DrahmiSchemaError
 from trading_agents.core.models import GenerateSignalRequest, NewsChunk, RiskOutput, StockInfo
 from trading_agents.graph import build as graph_build
 from trading_agents.graph.technical_node import run_technical_agent as actual_run_technical_agent
@@ -181,6 +182,69 @@ def test_generate_single_symbol_flow(tmp_path: Path, monkeypatch):
     payload = detail.json()
     assert payload["request_intent"]["symbols_requested"] == ["ATW"]
     assert payload["signal_status"] == "COMPLETED"
+
+
+def test_generate_returns_502_on_drahmi_auth_error(tmp_path: Path, monkeypatch):
+    _configure_env(tmp_path, monkeypatch)
+
+    client = TestClient(app)
+    _authenticate_client(client)
+    services = get_services()
+
+    async def fake_get_stock(symbol: str):
+        raise DrahmiAuthError("Drahmi request failed with status 401: unauthorized")
+
+    services.graph_service.drahmi_client.get_stock = fake_get_stock
+
+    response = client.post("/signals/generate", json={"prompt": "Analyze ATW"})
+    assert response.status_code == 502
+    assert "status 401" in response.json()["detail"]
+
+
+def test_generate_returns_404_on_drahmi_not_found(tmp_path: Path, monkeypatch):
+    _configure_env(tmp_path, monkeypatch)
+
+    client = TestClient(app)
+    _authenticate_client(client)
+    services = get_services()
+
+    async def fake_get_stock(symbol: str):
+        raise DrahmiNotFoundError("Drahmi request failed with status 404: not found")
+
+    services.graph_service.drahmi_client.get_stock = fake_get_stock
+
+    response = client.post("/signals/generate", json={"prompt": "Analyze ATW"})
+    assert response.status_code == 404
+    assert "status 404" in response.json()["detail"]
+
+
+def test_generate_returns_502_on_drahmi_schema_error_and_persists_failure(tmp_path: Path, monkeypatch):
+    _configure_env(tmp_path, monkeypatch)
+
+    client = TestClient(app)
+    _authenticate_client(client)
+    services = get_services()
+
+    async def fake_get_stock(symbol: str):
+        raise DrahmiSchemaError("/stocks/ATW field 'last_price' must be numeric.")
+
+    services.graph_service.drahmi_client.get_stock = fake_get_stock
+
+    response = client.post("/signals/generate", json={"prompt": "Analyze ATW"})
+    assert response.status_code == 502
+    assert "last_price" in response.json()["detail"]
+
+    history = client.get("/history")
+    assert history.status_code == 200
+    failed_records = [record for record in history.json() if record["status"] == "FAILED"]
+    assert failed_records
+    request_id = failed_records[0]["request_id"]
+
+    detail = client.get(f"/signals/{request_id}")
+    assert detail.status_code == 200
+    failure = detail.json()["failure"]
+    assert failure["error_type"] == "drahmi_schema_error"
+    assert failure["status_code"] == 502
 
 
 def test_generate_universe_scan(tmp_path: Path, monkeypatch):

@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from trading_agents.api.routes import auth, history, signals
-from trading_agents.api.deps import get_services
+from trading_agents.api.deps import ServicesDep, get_services
 
 
 @asynccontextmanager
@@ -21,8 +21,8 @@ app = FastAPI(title="Morocco Trading Agents", lifespan=lifespan)
 
 
 @app.get("/health")
-def health():
-    return get_services().health()
+def health(services: ServicesDep):
+    return services.health()
 
 
 app.include_router(auth.router)

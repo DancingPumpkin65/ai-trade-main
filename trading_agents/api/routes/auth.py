@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 
-from trading_agents.api.deps import get_services
+from trading_agents.api.deps import ServicesDep
 from trading_agents.core.models import UserCreate, UserLogin
 
 
@@ -10,8 +10,7 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 @router.post("/register")
-def register(payload: UserCreate):
-    services = get_services()
+def register(payload: UserCreate, services: ServicesDep):
     try:
         return services.auth_service.register(payload.username, payload.password)
     except Exception as exc:
@@ -19,8 +18,7 @@ def register(payload: UserCreate):
 
 
 @router.post("/login")
-def login(payload: UserLogin):
-    services = get_services()
+def login(payload: UserLogin, services: ServicesDep):
     try:
         return services.auth_service.login(payload.username, payload.password)
     except ValueError as exc:

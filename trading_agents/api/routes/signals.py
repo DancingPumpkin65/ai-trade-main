@@ -3,19 +3,22 @@ from __future__ import annotations
 import json
 import time
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sse_starlette.sse import EventSourceResponse
 
-from trading_agents.api.deps import get_services
+from trading_agents.api.deps import ServicesDep, get_current_username
 from trading_agents.core.models import GenerateSignalRequest, RiskPreference, SignalStatus, TimeHorizon
 
 
-router = APIRouter(prefix="/signals", tags=["signals"])
+router = APIRouter(
+    prefix="/signals",
+    tags=["signals"],
+    dependencies=[Depends(get_current_username)],
+)
 
 
 @router.post("/generate")
-def generate(payload: GenerateSignalRequest):
-    services = get_services()
+def generate(payload: GenerateSignalRequest, services: ServicesDep):
     try:
         return services.generate(payload).model_dump(mode="json")
     except ValueError as exc:
@@ -24,6 +27,7 @@ def generate(payload: GenerateSignalRequest):
 
 @router.get("/generate/stream")
 def stream(
+    services: ServicesDep,
     request_id: str | None = Query(default=None),
     symbol: str | None = Query(default=None),
     capital: float | None = Query(default=None),
@@ -31,7 +35,6 @@ def stream(
     risk_profile: RiskPreference | None = Query(default=None),
     time_horizon: TimeHorizon | None = Query(default=None),
 ):
-    services = get_services()
     created_live_request = False
 
     if request_id is None:
@@ -88,8 +91,7 @@ def stream(
 
 
 @router.get("/{request_id}")
-def get_signal(request_id: str):
-    services = get_services()
+def get_signal(request_id: str, services: ServicesDep):
     try:
         return services.export_signal_detail(request_id)
     except ValueError as exc:
@@ -97,8 +99,7 @@ def get_signal(request_id: str):
 
 
 @router.post("/{request_id}/approve")
-def approve(request_id: str):
-    services = get_services()
+def approve(request_id: str, services: ServicesDep):
     try:
         return services.approve(request_id).model_dump(mode="json")
     except ValueError as exc:
@@ -106,8 +107,7 @@ def approve(request_id: str):
 
 
 @router.post("/{request_id}/reject")
-def reject(request_id: str):
-    services = get_services()
+def reject(request_id: str, services: ServicesDep):
     try:
         return services.reject(request_id).model_dump(mode="json")
     except ValueError as exc:
@@ -115,8 +115,7 @@ def reject(request_id: str):
 
 
 @router.get("/{request_id}/alpaca-order")
-def get_alpaca_order(request_id: str):
-    services = get_services()
+def get_alpaca_order(request_id: str, services: ServicesDep):
     try:
         return services.get_alpaca_order(request_id)
     except ValueError as exc:
@@ -124,8 +123,7 @@ def get_alpaca_order(request_id: str):
 
 
 @router.get("/{request_id}/opportunities/{symbol}/alpaca-order")
-def get_opportunity_alpaca_order(request_id: str, symbol: str):
-    services = get_services()
+def get_opportunity_alpaca_order(request_id: str, symbol: str, services: ServicesDep):
     try:
         return services.get_universe_opportunity_alpaca_order(request_id, symbol)
     except ValueError as exc:
@@ -133,8 +131,7 @@ def get_opportunity_alpaca_order(request_id: str, symbol: str):
 
 
 @router.post("/{request_id}/opportunities/{symbol}/approve")
-def approve_opportunity(request_id: str, symbol: str):
-    services = get_services()
+def approve_opportunity(request_id: str, symbol: str, services: ServicesDep):
     try:
         return services.approve_universe_opportunity(request_id, symbol)
     except ValueError as exc:
@@ -142,8 +139,7 @@ def approve_opportunity(request_id: str, symbol: str):
 
 
 @router.post("/{request_id}/opportunities/{symbol}/reject")
-def reject_opportunity(request_id: str, symbol: str):
-    services = get_services()
+def reject_opportunity(request_id: str, symbol: str, services: ServicesDep):
     try:
         return services.reject_universe_opportunity(request_id, symbol)
     except ValueError as exc:

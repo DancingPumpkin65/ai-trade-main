@@ -20,6 +20,7 @@ from trading_agents.core.data.news_global import MarketAuxClient
 from trading_agents.core.data.news_morocco import MoroccoNewsClient
 from trading_agents.core.intent.normalizer import OllamaIntentNormalizer
 from trading_agents.core.intent.parser import IntentParser
+from trading_agents.core.llm import OllamaAgentLLM, set_default_agent_llm
 from trading_agents.core.models import AlpacaOrderStatus, GenerateSignalRequest, GenerateSignalResponse, SignalRecord, SignalStatus
 from trading_agents.core.observability import LangSmithIntentTracer
 from trading_agents.core.storage import Storage
@@ -96,6 +97,14 @@ class AppServices:
                 model=settings.ollama_model,
             ),
             tracer=intent_tracer,
+        )
+        set_default_agent_llm(
+            OllamaAgentLLM(
+                base_url=settings.ollama_base_url,
+                model=settings.ollama_model,
+                enabled=settings.agent_llm_enabled,
+                timeout=settings.agent_llm_timeout,
+            )
         )
         self.alpaca_preview_service = AlpacaPreviewService(
             enabled=settings.alpaca_enabled,
@@ -205,6 +214,7 @@ class AppServices:
             "schema_version": self.storage.schema_version,
             "langgraph_checkpoint_path": str(self.settings.langgraph_checkpoint_path),
             "langsmith_tracing": self.settings.langsmith_tracing,
+            "agent_llm_enabled": self.settings.agent_llm_enabled,
             "alpaca_enabled": self.settings.alpaca_enabled,
             "alpaca_require_order_approval": self.settings.alpaca_require_order_approval,
             "alpaca_submit_orders": self.settings.alpaca_submit_orders,

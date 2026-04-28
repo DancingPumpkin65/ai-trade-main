@@ -24,6 +24,8 @@ class Settings(BaseSettings):
 
     ollama_base_url: str = Field(default="http://localhost:11434", alias="OLLAMA_BASE_URL")
     ollama_model: str = Field(default="qwen2.5:7b-instruct", alias="OLLAMA_MODEL")
+    agent_llm_enabled: bool = Field(default=False, alias="AGENT_LLM_ENABLED")
+    agent_llm_timeout: float = Field(default=20.0, alias="AGENT_LLM_TIMEOUT")
 
     chroma_persist_dir: Path = Field(default=Path("./data/chroma"), alias="CHROMA_PERSIST_DIR")
     langgraph_checkpoint_path: Path = Field(

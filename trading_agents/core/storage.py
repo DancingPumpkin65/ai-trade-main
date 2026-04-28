@@ -18,6 +18,7 @@ from trading_agents.core.models import (
     CoordinatorOutput,
     UniverseScanCandidateRecord,
 )
+from trading_agents.core.migrations import MigrationRunner
 
 
 def _json_default(value):
@@ -32,6 +33,7 @@ class Storage:
     def __init__(self, db_path: Path):
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.migration_runner = MigrationRunner(db_path)
         self.init_db()
 
     @contextmanager
@@ -45,77 +47,11 @@ class Storage:
             conn.close()
 
     def init_db(self) -> None:
-        with self.connection() as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    username TEXT UNIQUE NOT NULL,
-                    password_hash TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
+        self.migration_runner.migrate()
 
-                CREATE TABLE IF NOT EXISTS signal_requests (
-                    request_id TEXT PRIMARY KEY,
-                    status TEXT NOT NULL,
-                    raw_prompt TEXT,
-                    request_intent_json TEXT NOT NULL,
-                    parser_confidence REAL NOT NULL,
-                    extraction_method TEXT NOT NULL,
-                    human_review_required INTEGER NOT NULL DEFAULT 0,
-                    final_signal_json TEXT,
-                    opportunity_list_json TEXT,
-                    coordinator_output_json TEXT,
-                    alpaca_order_json TEXT,
-                    alpaca_order_status TEXT NOT NULL DEFAULT 'NOT_PREPARED',
-                    errors_json TEXT NOT NULL DEFAULT '[]',
-                    state_json TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS audit_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    request_id TEXT,
-                    event_type TEXT NOT NULL,
-                    message TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS signal_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    request_id TEXT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS universe_scan_candidates (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    request_id TEXT NOT NULL,
-                    symbol TEXT NOT NULL,
-                    score REAL,
-                    reasons_json TEXT NOT NULL DEFAULT '[]',
-                    selected_for_deep_eval INTEGER NOT NULL DEFAULT 0,
-                    rank_position INTEGER,
-                    evaluation_status TEXT NOT NULL,
-                    rejection_reason TEXT,
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS opportunity_alpaca_orders (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    request_id TEXT NOT NULL,
-                    symbol TEXT NOT NULL,
-                    alpaca_order_json TEXT NOT NULL,
-                    alpaca_order_status TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    UNIQUE(request_id, symbol)
-                );
-                """
-            )
+    @property
+    def schema_version(self) -> int:
+        return self.migration_runner.current_version()
 
     def create_request(self, request_id: str, intent: RequestIntent) -> None:
         now = datetime.now(timezone.utc).isoformat()

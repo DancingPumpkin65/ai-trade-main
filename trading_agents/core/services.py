@@ -159,6 +159,7 @@ class AppServices:
         return {
             "status": "ok",
             "db_path": str(self.settings.db_path),
+            "schema_version": self.storage.schema_version,
             "langgraph_checkpoint_path": str(self.settings.langgraph_checkpoint_path),
             "langsmith_tracing": self.settings.langsmith_tracing,
             "alpaca_enabled": self.settings.alpaca_enabled,

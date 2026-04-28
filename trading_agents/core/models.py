@@ -239,6 +239,10 @@ class AlpacaOrderIntent(BaseModel):
     submission_eligible: bool = False
     status: AlpacaOrderStatus = AlpacaOrderStatus.NOT_PREPARED
     reason: str | None = None
+    broker_order_id: str | None = None
+    broker_order_status: str | None = None
+    broker_submission_mode: str | None = None
+    submitted_at: datetime | None = None
     created_at: datetime
 
 

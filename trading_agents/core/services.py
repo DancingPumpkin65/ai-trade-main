@@ -88,6 +88,15 @@ class AppServices:
         )
         self.auth_service = AuthService(self.storage, settings.secret_key)
 
+    def _finalize_approved_order(self, order):
+        approved_order = self.alpaca_preview_service.approve_preview(
+            order,
+            submission_enabled=self.settings.alpaca_submit_orders,
+        )
+        if self.settings.alpaca_submit_orders:
+            approved_order = self.alpaca_preview_service.submit_order(approved_order)
+        return approved_order
+
     def _prepare_request(self, payload: GenerateSignalRequest):
         intent = self.intent_parser.parse(payload)
         self.storage.create_request(intent.request_id, intent)
@@ -137,6 +146,7 @@ class AppServices:
             "alpaca_enabled": self.settings.alpaca_enabled,
             "alpaca_require_order_approval": self.settings.alpaca_require_order_approval,
             "alpaca_submit_orders": self.settings.alpaca_submit_orders,
+            "alpaca_submission_mode": self.alpaca_preview_service.submission_mode(),
             "langgraph_enabled": self.graph_service.langgraph_enabled,
             "rag_backend": self.graph_service.vector_store.backend_name,
             "bourse_cache_dir": str(self.settings.data_dir / "bourse_pdfs"),
@@ -168,10 +178,17 @@ class AppServices:
         record = self.get_signal(request_id)
         if record.alpaca_order is None or record.alpaca_order_status != AlpacaOrderStatus.PREPARED:
             raise ValueError("No Alpaca order preview is available for approval.")
-        approved_order = self.alpaca_preview_service.approve_preview(
-            record.alpaca_order,
-            submission_enabled=self.settings.alpaca_submit_orders,
-        )
+        try:
+            approved_order = self._finalize_approved_order(record.alpaca_order)
+        except ValueError as exc:
+            self.storage.add_audit_log(
+                request_id,
+                "order_submission_failed",
+                "Broker submission failed during Alpaca order approval.",
+                {"error": str(exc)},
+            )
+            self.storage.add_event(request_id, "alpaca_order_submission_failed", {"error": str(exc)})
+            raise
         self.storage.update_request(
             request_id,
             status=SignalStatus.COMPLETED,
@@ -260,10 +277,21 @@ class AppServices:
         order = self._prepare_universe_opportunity_order(request_id, symbol)
         if order.status != AlpacaOrderStatus.PREPARED:
             raise ValueError("No prepared Alpaca order preview is available for this opportunity.")
-        approved_order = self.alpaca_preview_service.approve_preview(
-            order,
-            submission_enabled=self.settings.alpaca_submit_orders,
-        )
+        try:
+            approved_order = self._finalize_approved_order(order)
+        except ValueError as exc:
+            self.storage.add_audit_log(
+                request_id,
+                "opportunity_order_submission_failed",
+                "Broker submission failed during universe opportunity approval.",
+                {"symbol": symbol.upper(), "error": str(exc)},
+            )
+            self.storage.add_event(
+                request_id,
+                "opportunity_alpaca_order_submission_failed",
+                {"symbol": symbol.upper(), "error": str(exc)},
+            )
+            raise
         self.storage.upsert_opportunity_alpaca_order(request_id, symbol, approved_order)
         self.storage.add_audit_log(
             request_id,

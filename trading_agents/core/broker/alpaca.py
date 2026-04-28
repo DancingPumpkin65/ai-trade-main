@@ -30,6 +30,13 @@ class AlpacaPreviewService:
     def register_symbol_mapping(self, casablanca_symbol: str, alpaca_symbol: str) -> None:
         self.symbol_mapping[casablanca_symbol.upper()] = alpaca_symbol.upper()
 
+    def submission_mode(self) -> str:
+        if "paper-api.alpaca.markets" in self.base_url:
+            return "paper"
+        if "api.alpaca.markets" in self.base_url:
+            return "live"
+        return "custom"
+
     def _build_unmappable_order(
         self,
         *,
@@ -130,6 +137,7 @@ class AlpacaPreviewService:
             submission_eligible=False,
             status=AlpacaOrderStatus.PREPARED,
             reason=validation_note,
+            broker_submission_mode=self.submission_mode(),
             created_at=datetime.now(timezone.utc),
         )
 
@@ -155,5 +163,56 @@ class AlpacaPreviewService:
                 "status": AlpacaOrderStatus.REJECTED,
                 "submission_eligible": False,
                 "reason": "Operator rejected the Alpaca order command.",
+            }
+        )
+
+    def submit_order(self, order: AlpacaOrderIntent) -> AlpacaOrderIntent:
+        if order.status != AlpacaOrderStatus.APPROVED:
+            raise ValueError("Only approved Alpaca previews can be submitted.")
+        if not self.enabled:
+            raise ValueError("Alpaca integration is disabled.")
+        if not self.api_key_id or not self.api_secret_key:
+            raise ValueError("Alpaca credentials are not configured for broker submission.")
+        if not order.alpaca_symbol or not order.side or not order.type or not order.time_in_force:
+            raise ValueError("The Alpaca order preview is incomplete and cannot be submitted.")
+
+        headers = {
+            "APCA-API-KEY-ID": self.api_key_id,
+            "APCA-API-SECRET-KEY": self.api_secret_key,
+        }
+        payload = {
+            "symbol": order.alpaca_symbol,
+            "side": order.side,
+            "type": order.type,
+            "time_in_force": order.time_in_force,
+            "client_order_id": order.client_order_id,
+        }
+        if order.notional is not None:
+            payload["notional"] = f"{order.notional:.2f}"
+        elif order.qty is not None:
+            payload["qty"] = str(order.qty)
+        else:
+            raise ValueError("The Alpaca order preview has neither notional nor quantity.")
+
+        try:
+            with self.client_factory(base_url=self.base_url, headers=headers, timeout=self.timeout_seconds) as client:
+                response = client.post("/v2/orders", json=payload)
+                response.raise_for_status()
+                body = response.json()
+        except httpx.HTTPStatusError as exc:
+            message = exc.response.text or f"status {exc.response.status_code}"
+            raise ValueError(f"Alpaca order submission failed: {message}") from exc
+        except httpx.HTTPError as exc:
+            raise ValueError(f"Alpaca order submission failed: {exc}") from exc
+
+        return order.model_copy(
+            update={
+                "preview_only": False,
+                "submission_eligible": True,
+                "broker_order_id": body.get("id"),
+                "broker_order_status": body.get("status"),
+                "broker_submission_mode": self.submission_mode(),
+                "submitted_at": datetime.now(timezone.utc),
+                "reason": f"Submitted to Alpaca {self.submission_mode()} trading.",
             }
         )

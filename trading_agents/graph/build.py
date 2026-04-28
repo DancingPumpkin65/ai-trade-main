@@ -337,6 +337,8 @@ class TradingGraphService:
                 alpaca_preview,
                 submission_enabled=self.alpaca_submit_orders,
             )
+            if self.alpaca_submit_orders:
+                alpaca_preview = self.alpaca_preview_service.submit_order(alpaca_preview)
             self.storage.add_event(request_id, "alpaca_order_auto_approved", alpaca_preview.model_dump(mode="json"))
         else:
             self.storage.add_event(request_id, "alpaca_preview_prepared", alpaca_preview.model_dump(mode="json"))

@@ -24,6 +24,9 @@ class AuthService:
         self.storage = storage
         self.secret_key = secret_key.encode("utf-8")
 
+    def _sign_username(self, username: str) -> str:
+        return hmac.new(self.secret_key, username.encode("utf-8"), hashlib.sha256).hexdigest()
+
     def register(self, username: str, password: str) -> dict:
         password_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
         with self.storage.connection() as conn:
@@ -42,9 +45,24 @@ class AuthService:
         provided = hashlib.sha256(password.encode("utf-8")).hexdigest()
         if not hmac.compare_digest(expected, provided):
             raise ValueError("Invalid credentials.")
-        signature = hmac.new(self.secret_key, username.encode("utf-8"), hashlib.sha256).hexdigest()
+        signature = self._sign_username(username)
         token = base64.urlsafe_b64encode(f"{username}:{signature}".encode("utf-8")).decode("utf-8")
         return {"access_token": token, "token_type": "bearer"}
+
+    def authenticate_token(self, token: str) -> str:
+        try:
+            padded = token + "=" * (-len(token) % 4)
+            decoded = base64.urlsafe_b64decode(padded.encode("utf-8")).decode("utf-8")
+            username, provided_signature = decoded.split(":", 1)
+        except Exception as exc:
+            raise ValueError("Invalid authentication token.") from exc
+
+        expected_signature = self._sign_username(username)
+        if not hmac.compare_digest(expected_signature, provided_signature):
+            raise ValueError("Invalid authentication token.")
+        if not self.storage.user_exists(username):
+            raise ValueError("Invalid authentication token.")
+        return username
 
 
 class AppServices:

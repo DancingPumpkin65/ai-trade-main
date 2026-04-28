@@ -140,6 +140,11 @@ class Storage:
                 ),
             )
 
+    def user_exists(self, username: str) -> bool:
+        with self.connection() as conn:
+            row = conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone()
+        return row is not None
+
     def update_request(
         self,
         request_id: str,

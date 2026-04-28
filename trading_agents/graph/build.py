@@ -221,6 +221,51 @@ class TradingGraphService:
             "risk_preference": request_intent.risk_preference.value if request_intent else None,
         }
 
+    def _sentiment_query_plan(self, *, symbol: str, request_intent: RequestIntent, market_data: StockInfo) -> list[str]:
+        raw_queries = [
+            f"{symbol} Morocco",
+            f"{symbol} corporate notice Morocco",
+            f"{symbol} dividend earnings Morocco",
+            f"{symbol} {market_data.name} Morocco",
+        ]
+        if request_intent.time_horizon.value in {"INTRADAY", "SHORT_TERM"}:
+            raw_queries.append(f"{symbol} catalyst Morocco this week")
+        else:
+            raw_queries.append(f"{symbol} guidance outlook Morocco")
+        if market_data.sector and market_data.sector != "Unknown":
+            raw_queries.append(f"{symbol} {market_data.sector} Morocco")
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for query in raw_queries:
+            normalized = " ".join(query.split()).strip()
+            if not normalized or normalized.lower() in seen:
+                continue
+            seen.add(normalized.lower())
+            deduped.append(normalized)
+        return deduped[:5]
+
+    def _merge_news_chunks(self, existing: list[NewsChunk], incoming: list[NewsChunk]) -> list[NewsChunk]:
+        merged: dict[str, NewsChunk] = {chunk.chunk_id: chunk for chunk in existing}
+        for chunk in incoming:
+            current = merged.get(chunk.chunk_id)
+            if current is None or chunk.similarity_score > current.similarity_score:
+                merged[chunk.chunk_id] = chunk
+        return sorted(
+            merged.values(),
+            key=lambda chunk: (chunk.similarity_score, 0 if chunk.low_confidence else 1),
+            reverse=True,
+        )
+
+    def _sentiment_retrieval_is_sufficient(self, chunks: list[NewsChunk]) -> bool:
+        high_confidence = [chunk for chunk in chunks if chunk.similarity_score >= 0.55 and not chunk.low_confidence]
+        authoritative = [
+            chunk
+            for chunk in high_confidence
+            if chunk.metadata.get("doc_type") in {"corporate_notices", "issuer_publication", "market_overview"}
+        ]
+        return len(high_confidence) >= 2 or bool(authoritative)
+
     def _safe_sentiment_output(self, symbol: str, note: str) -> SentimentOutput:
         return SentimentOutput(
             sentiment_score=0.5,
@@ -448,7 +493,8 @@ class TradingGraphService:
         market_data = None
         request_context = None
         news_chunks: list[NewsChunk] = []
-        searches = 0
+        search_plan: list[str] = []
+        search_index = 0
         for iteration in range(1, self.max_agent_iterations + 1):
             if market_data is None:
                 args = {"symbol": symbol}
@@ -461,22 +507,39 @@ class TradingGraphService:
                 self._record_tool_interaction(request_id, "sentiment", "get_request_intent", {}, request_context)
                 messages.append({"role": "tool", "tool": "get_request_intent", "iteration": iteration, "content": "Loaded request intent context."})
                 continue
-            if searches == 0:
-                query = f"{symbol} Morocco"
+            if not search_plan:
+                search_plan = self._sentiment_query_plan(
+                    symbol=symbol,
+                    request_intent=RequestIntent.model_validate(request_context),
+                    market_data=market_data,
+                )
+            if search_index < len(search_plan) and (
+                not news_chunks or not self._sentiment_retrieval_is_sufficient(news_chunks)
+            ):
+                query = search_plan[search_index]
                 args = {"query": query, "top_k": 5, "filters": None}
-                news_chunks = self.mcp.call_tool("sentiment", "search_news", **args)
-                searches += 1
-                self._record_tool_interaction(request_id, "sentiment", "search_news", args, [chunk.model_dump(mode="json") for chunk in news_chunks])
-                messages.append({"role": "assistant", "iteration": iteration, "content": f"Searching news with query: {query}"})
-                continue
-            high_confidence = [chunk for chunk in news_chunks if chunk.similarity_score >= 0.55]
-            if searches < 2 and len(high_confidence) < 2:
-                query = f"{symbol} corporate notice Morocco"
-                args = {"query": query, "top_k": 5, "filters": None}
-                news_chunks = self.mcp.call_tool("sentiment", "search_news", **args)
-                searches += 1
-                self._record_tool_interaction(request_id, "sentiment", "search_news", args, [chunk.model_dump(mode="json") for chunk in news_chunks])
-                messages.append({"role": "assistant", "iteration": iteration, "content": f"Retrying retrieval with query: {query}"})
+                retrieved_chunks = self.mcp.call_tool("sentiment", "search_news", **args)
+                news_chunks = self._merge_news_chunks(news_chunks, retrieved_chunks)
+                search_index += 1
+                self._record_tool_interaction(
+                    request_id,
+                    "sentiment",
+                    "search_news",
+                    args,
+                    [chunk.model_dump(mode="json") for chunk in retrieved_chunks],
+                )
+                status_note = (
+                    "Initial retrieval query."
+                    if search_index == 1
+                    else f"Expanded retrieval query {search_index}/{len(search_plan)}."
+                )
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "iteration": iteration,
+                        "content": f"{status_note} Query: {query}",
+                    }
+                )
                 continue
             output = run_sentiment_agent(
                 symbol=symbol,

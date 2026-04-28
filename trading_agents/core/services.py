@@ -4,11 +4,18 @@ import base64
 import hashlib
 import hmac
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from trading_agents.core.broker.alpaca import AlpacaPreviewService
 from trading_agents.core.config import Settings
-from trading_agents.core.data.drahmi import DrahmiClient
+from trading_agents.core.data.drahmi import (
+    DrahmiAuthError,
+    DrahmiClient,
+    DrahmiClientError,
+    DrahmiNotFoundError,
+    DrahmiSchemaError,
+)
 from trading_agents.core.data.news_global import MarketAuxClient
 from trading_agents.core.data.news_morocco import MoroccoNewsClient
 from trading_agents.core.intent.normalizer import OllamaIntentNormalizer
@@ -63,6 +70,16 @@ class AuthService:
         if not self.storage.user_exists(username):
             raise ValueError("Invalid authentication token.")
         return username
+
+
+@dataclass
+class ServiceRequestError(Exception):
+    status_code: int
+    detail: str
+    error_type: str
+
+    def __str__(self) -> str:
+        return self.detail
 
 
 class AppServices:
@@ -135,22 +152,47 @@ class AppServices:
         )
         return intent
 
-    def _execute_request(self, request_id: str, runner) -> None:
+    def _classify_execution_exception(self, exc: Exception) -> tuple[int, str]:
+        if isinstance(exc, DrahmiNotFoundError):
+            return 404, "drahmi_not_found"
+        if isinstance(exc, DrahmiAuthError):
+            return 502, "drahmi_auth_error"
+        if isinstance(exc, DrahmiSchemaError):
+            return 502, "drahmi_schema_error"
+        if isinstance(exc, DrahmiClientError):
+            return 502, "drahmi_client_error"
+        return 500, "pipeline_error"
+
+    def _execute_request(self, request_id: str, runner, *, raise_on_failure: bool = False) -> None:
         try:
             runner()
         except Exception as exc:
+            status_code, error_type = self._classify_execution_exception(exc)
+            existing_state = self.storage.get_saved_state(request_id) or {}
+            failure_payload = {
+                "error": str(exc),
+                "error_type": error_type,
+                "status_code": status_code,
+            }
             self.storage.update_request(
                 request_id,
                 status=SignalStatus.FAILED,
                 errors=[str(exc)],
+                state={**existing_state, "failure": failure_payload},
             )
             self.storage.add_audit_log(
                 request_id,
                 "pipeline_failed",
                 "Analysis execution failed.",
-                {"error": str(exc)},
+                failure_payload,
             )
-            self.storage.add_event(request_id, "pipeline_failed", {"error": str(exc)})
+            self.storage.add_event(request_id, "pipeline_failed", failure_payload)
+            if raise_on_failure:
+                raise ServiceRequestError(
+                    status_code=status_code,
+                    detail=str(exc),
+                    error_type=error_type,
+                ) from exc
 
     def close(self) -> None:
         self.graph_service.close()
@@ -173,7 +215,11 @@ class AppServices:
 
     def generate(self, payload: GenerateSignalRequest) -> GenerateSignalResponse:
         intent = self._prepare_request(payload)
-        self._execute_request(intent.request_id, lambda: self.graph_service.start(intent))
+        self._execute_request(
+            intent.request_id,
+            lambda: self.graph_service.start(intent),
+            raise_on_failure=True,
+        )
         record = self.storage.get_signal_record(intent.request_id)
         return GenerateSignalResponse(request_id=intent.request_id, status=record.status if record else SignalStatus.FAILED)
 
@@ -362,6 +408,7 @@ class AppServices:
         payload["order_approval_required"] = record.alpaca_order_status.value == "PREPARED"
         saved_state = self.storage.get_saved_state(request_id) or {}
         payload["analysis_warnings"] = saved_state.get("analysis_warning_reasons", [])
+        payload["failure"] = saved_state.get("failure")
         payload["universe_scan_candidates"] = [
             candidate.model_dump(mode="json")
             for candidate in self.storage.get_universe_scan_candidates(request_id)

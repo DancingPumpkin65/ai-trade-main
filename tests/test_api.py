@@ -67,6 +67,16 @@ def _configure_env(tmp_path: Path, monkeypatch) -> None:
     get_services.cache_clear()
 
 
+def _authenticate_client(client: TestClient, username: str = "operator", password: str = "test-pass-123") -> str:
+    register = client.post("/auth/register", json={"username": username, "password": password})
+    assert register.status_code == 200
+    login = client.post("/auth/login", json={"username": username, "password": password})
+    assert login.status_code == 200
+    token = login.json()["access_token"]
+    client.headers.update({"Authorization": f"Bearer {token}"})
+    return token
+
+
 def _volatile_stock(symbol: str = "ATW") -> StockInfo:
     closes = [100, 135, 82, 140, 78, 145, 74, 150, 70, 155, 68, 160, 66, 162, 64, 165, 62, 168, 60, 170, 58, 172]
     history = []
@@ -129,10 +139,39 @@ def _trend_stock(
     )
 
 
+def test_protected_routes_require_authentication(tmp_path: Path, monkeypatch):
+    _configure_env(tmp_path, monkeypatch)
+
+    client = TestClient(app)
+    response = client.get("/history")
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Authentication required."
+
+
+def test_protected_routes_reject_invalid_token(tmp_path: Path, monkeypatch):
+    _configure_env(tmp_path, monkeypatch)
+
+    client = TestClient(app)
+    response = client.get("/history", headers={"Authorization": "Bearer not-a-real-token"})
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid authentication token."
+
+
+def test_valid_token_allows_protected_access(tmp_path: Path, monkeypatch):
+    _configure_env(tmp_path, monkeypatch)
+
+    client = TestClient(app)
+    _authenticate_client(client)
+    response = client.get("/history")
+    assert response.status_code == 200
+    assert response.json() == []
+
+
 def test_generate_single_symbol_flow(tmp_path: Path, monkeypatch):
     _configure_env(tmp_path, monkeypatch)
 
     client = TestClient(app)
+    _authenticate_client(client)
     response = client.post("/signals/generate", json={"prompt": "Analyze ATW with conservative risk"})
     assert response.status_code == 200
     request_id = response.json()["request_id"]
@@ -148,6 +187,7 @@ def test_generate_universe_scan(tmp_path: Path, monkeypatch):
     _configure_env(tmp_path, monkeypatch)
 
     client = TestClient(app)
+    _authenticate_client(client)
     response = client.post("/signals/generate", json={"prompt": "I have 100,000 MAD. What are the best possible trades this week?"})
     assert response.status_code == 200
     request_id = response.json()["request_id"]
@@ -164,6 +204,7 @@ def test_live_generate_stream_starts_request_and_emits_pipeline_events(tmp_path:
     _configure_env(tmp_path, monkeypatch)
 
     client = TestClient(app)
+    _authenticate_client(client)
     seen_events: list[tuple[str, dict]] = []
     current_event: str | None = None
 
@@ -195,6 +236,7 @@ def test_live_generate_stream_starts_request_and_emits_pipeline_events(tmp_path:
 def test_order_approval_flow_marks_prepared_preview_as_approved(tmp_path: Path, monkeypatch):
     _configure_env(tmp_path, monkeypatch)
     client = TestClient(app)
+    _authenticate_client(client)
     services = get_services()
     services.graph_service.alpaca_preview_service.register_symbol_mapping("ATW", "SPY")
 
@@ -226,6 +268,7 @@ def test_order_approval_flow_marks_prepared_preview_as_approved(tmp_path: Path, 
 def test_alpaca_preview_is_unmappable_after_analysis_without_symbol_mapping(tmp_path: Path, monkeypatch):
     _configure_env(tmp_path, monkeypatch)
     client = TestClient(app)
+    _authenticate_client(client)
     services = get_services()
 
     async def fake_get_stock(symbol: str):
@@ -256,6 +299,7 @@ def test_alpaca_preview_is_unmappable_after_analysis_without_symbol_mapping(tmp_
 def test_alpaca_preview_is_prepared_after_analysis_with_symbol_mapping(tmp_path: Path, monkeypatch):
     _configure_env(tmp_path, monkeypatch)
     client = TestClient(app)
+    _authenticate_client(client)
     services = get_services()
     services.graph_service.alpaca_preview_service.register_symbol_mapping("ATW", "SPY")
 
@@ -304,6 +348,7 @@ def test_alpaca_preview_is_prepared_after_analysis_with_symbol_mapping(tmp_path:
 def test_order_reject_flow_marks_prepared_preview_as_rejected(tmp_path: Path, monkeypatch):
     _configure_env(tmp_path, monkeypatch)
     client = TestClient(app)
+    _authenticate_client(client)
     services = get_services()
     services.graph_service.alpaca_preview_service.register_symbol_mapping("ATW", "SPY")
 
@@ -327,6 +372,7 @@ def test_order_reject_flow_marks_prepared_preview_as_rejected(tmp_path: Path, mo
 def test_order_approval_endpoint_rejects_unmappable_preview(tmp_path: Path, monkeypatch):
     _configure_env(tmp_path, monkeypatch)
     client = TestClient(app)
+    _authenticate_client(client)
     services = get_services()
 
     async def fake_get_stock(symbol: str):
@@ -347,6 +393,7 @@ def test_full_access_mode_auto_approves_prepared_alpaca_command(tmp_path: Path, 
     monkeypatch.setenv("ALPACA_REQUIRE_ORDER_APPROVAL", "false")
     get_services.cache_clear()
     client = TestClient(app)
+    _authenticate_client(client)
     services = get_services()
     services.graph_service.alpaca_preview_service.register_symbol_mapping("ATW", "SPY")
 
@@ -390,6 +437,7 @@ def test_order_approval_submits_to_alpaca_when_enabled(tmp_path: Path, monkeypat
     monkeypatch.setenv("ALPACA_API_SECRET_KEY", "paper-secret")
     get_services.cache_clear()
     client = TestClient(app)
+    _authenticate_client(client)
     services = get_services()
     services.graph_service.alpaca_preview_service.register_symbol_mapping("ATW", "SPY")
 
@@ -450,6 +498,7 @@ def test_full_access_mode_auto_submits_when_enabled(tmp_path: Path, monkeypatch)
     monkeypatch.setenv("ALPACA_API_SECRET_KEY", "paper-secret")
     get_services.cache_clear()
     client = TestClient(app)
+    _authenticate_client(client)
     services = get_services()
     services.graph_service.alpaca_preview_service.register_symbol_mapping("ATW", "SPY")
 
@@ -503,6 +552,7 @@ def test_full_access_mode_auto_submits_when_enabled(tmp_path: Path, monkeypatch)
 def test_technical_bias_mismatch_retries_then_recovers(tmp_path: Path, monkeypatch):
     _configure_env(tmp_path, monkeypatch)
     client = TestClient(app)
+    _authenticate_client(client)
     services = get_services()
 
     calls = {"count": 0}
@@ -531,6 +581,7 @@ def test_technical_bias_mismatch_retries_then_recovers(tmp_path: Path, monkeypat
 def test_technical_bias_mismatch_caps_and_force_corrects(tmp_path: Path, monkeypatch):
     _configure_env(tmp_path, monkeypatch)
     client = TestClient(app)
+    _authenticate_client(client)
     services = get_services()
 
     def always_mismatch(stock_info, mismatch_feedback=None):
@@ -555,6 +606,7 @@ def test_technical_bias_mismatch_caps_and_force_corrects(tmp_path: Path, monkeyp
 def test_agent_scratchpads_and_tool_events_are_recorded(tmp_path: Path, monkeypatch):
     _configure_env(tmp_path, monkeypatch)
     client = TestClient(app)
+    _authenticate_client(client)
     services = get_services()
 
     response = client.post("/signals/generate", json={"prompt": "Analyze ATW with conservative risk"})
@@ -586,6 +638,7 @@ def test_agent_scratchpads_and_tool_events_are_recorded(tmp_path: Path, monkeypa
 def test_agent_iteration_cap_falls_back_safely(tmp_path: Path, monkeypatch):
     _configure_env(tmp_path, monkeypatch)
     client = TestClient(app)
+    _authenticate_client(client)
     services = get_services()
     services.graph_service.max_agent_iterations = 1
 
@@ -693,6 +746,7 @@ def test_universe_scan_threshold_rejects_weak_candidates_before_deep_eval(tmp_pa
 def test_universe_scan_candidates_are_persisted_with_ranking_statuses(tmp_path: Path, monkeypatch):
     _configure_env(tmp_path, monkeypatch)
     client = TestClient(app)
+    _authenticate_client(client)
     services = get_services()
 
     strong = _trend_stock("ATW", "Attijariwafa Bank", last_volume=2_400_000.0, step=1.7)
@@ -750,6 +804,7 @@ def test_universe_scan_candidates_are_persisted_with_ranking_statuses(tmp_path: 
 def test_universe_opportunity_order_flow_is_scoped_per_symbol(tmp_path: Path, monkeypatch):
     _configure_env(tmp_path, monkeypatch)
     client = TestClient(app)
+    _authenticate_client(client)
     services = get_services()
     services.graph_service.alpaca_preview_service.register_symbol_mapping("ATW", "SPY")
 
@@ -817,6 +872,7 @@ def test_universe_opportunity_order_flow_is_scoped_per_symbol(tmp_path: Path, mo
 def test_universe_opportunity_order_is_unmappable_without_mapping(tmp_path: Path, monkeypatch):
     _configure_env(tmp_path, monkeypatch)
     client = TestClient(app)
+    _authenticate_client(client)
     services = get_services()
 
     strong = _trend_stock("ATW", "Attijariwafa Bank", last_volume=2_400_000.0, step=1.7)

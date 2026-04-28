@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import json
-import sqlite3
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
 
+from trading_agents.core.database import DatabaseAdapter, build_database_adapter
 from trading_agents.core.models import (
     AlpacaOrderIntent,
     AlpacaOrderStatus,
@@ -30,21 +28,16 @@ def _json_default(value):
 
 
 class Storage:
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, database_url: str | None = None):
         self.db_path = db_path
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.migration_runner = MigrationRunner(db_path)
+        self.database_url = database_url
+        self.adapter: DatabaseAdapter = build_database_adapter(database_url, db_path)
+        self.adapter.ensure_parent_dirs()
+        self.migration_runner = MigrationRunner(db_path, database_url)
         self.init_db()
 
-    @contextmanager
-    def connection(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        try:
-            yield conn
-            conn.commit()
-        finally:
-            conn.close()
+    def connection(self):
+        return self.adapter.connection()
 
     def init_db(self) -> None:
         self.migration_runner.migrate()
@@ -53,17 +46,23 @@ class Storage:
     def schema_version(self) -> int:
         return self.migration_runner.current_version()
 
+    @property
+    def backend_name(self) -> str:
+        return self.adapter.backend_name
+
     def create_request(self, request_id: str, intent: RequestIntent) -> None:
         now = datetime.now(timezone.utc).isoformat()
         payload = json.dumps(intent.model_dump(mode="json"), default=_json_default)
         with self.connection() as conn:
             conn.execute(
-                """
+                self.adapter.prepare_sql(
+                    """
                 INSERT INTO signal_requests (
                     request_id, status, raw_prompt, request_intent_json, parser_confidence,
                     extraction_method, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+                """
+                ),
                 (
                     request_id,
                     SignalStatus.PENDING.value,
@@ -78,7 +77,7 @@ class Storage:
 
     def user_exists(self, username: str) -> bool:
         with self.connection() as conn:
-            row = conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone()
+            row = conn.execute(self.adapter.prepare_sql("SELECT 1 FROM users WHERE username = ?"), (username,)).fetchone()
         return row is not None
 
     def update_request(
@@ -128,15 +127,20 @@ class Storage:
         values.append(request_id)
 
         with self.connection() as conn:
-            conn.execute(f"UPDATE signal_requests SET {', '.join(fields)} WHERE request_id = ?", values)
+            conn.execute(
+                self.adapter.prepare_sql(f"UPDATE signal_requests SET {', '.join(fields)} WHERE request_id = ?"),
+                values,
+            )
 
     def add_audit_log(self, request_id: str | None, event_type: str, message: str, payload: dict) -> None:
         with self.connection() as conn:
             conn.execute(
-                """
+                self.adapter.prepare_sql(
+                    """
                 INSERT INTO audit_log (request_id, event_type, message, payload_json, created_at)
                 VALUES (?, ?, ?, ?, ?)
-                """,
+                """
+                ),
                 (
                     request_id,
                     event_type,
@@ -149,10 +153,12 @@ class Storage:
     def add_event(self, request_id: str, event_type: str, payload: dict) -> None:
         with self.connection() as conn:
             conn.execute(
-                """
+                self.adapter.prepare_sql(
+                    """
                 INSERT INTO signal_events (request_id, event_type, payload_json, created_at)
                 VALUES (?, ?, ?, ?)
-                """,
+                """
+                ),
                 (
                     request_id,
                     event_type,
@@ -164,7 +170,9 @@ class Storage:
     def get_events(self, request_id: str) -> list[dict]:
         with self.connection() as conn:
             rows = conn.execute(
-                "SELECT event_type, payload_json, created_at FROM signal_events WHERE request_id = ? ORDER BY id ASC",
+                self.adapter.prepare_sql(
+                    "SELECT event_type, payload_json, created_at FROM signal_events WHERE request_id = ? ORDER BY id ASC"
+                ),
                 (request_id,),
             ).fetchall()
         return [
@@ -179,12 +187,14 @@ class Storage:
     def get_events_after(self, request_id: str, after_id: int = 0) -> list[dict]:
         with self.connection() as conn:
             rows = conn.execute(
-                """
+                self.adapter.prepare_sql(
+                    """
                 SELECT id, event_type, payload_json, created_at
                 FROM signal_events
                 WHERE request_id = ? AND id > ?
                 ORDER BY id ASC
-                """,
+                """
+                ),
                 (request_id, after_id),
             ).fetchall()
         return [
@@ -197,9 +207,12 @@ class Storage:
             for row in rows
         ]
 
-    def get_request_row(self, request_id: str) -> sqlite3.Row | None:
+    def get_request_row(self, request_id: str):
         with self.connection() as conn:
-            return conn.execute("SELECT * FROM signal_requests WHERE request_id = ?", (request_id,)).fetchone()
+            return conn.execute(
+                self.adapter.prepare_sql("SELECT * FROM signal_requests WHERE request_id = ?"),
+                (request_id,),
+            ).fetchone()
 
     def get_signal_record(self, request_id: str) -> SignalRecord | None:
         row = self.get_request_row(request_id)
@@ -236,7 +249,7 @@ class Storage:
     def list_history(self, limit: int = 50) -> list[SignalRecord]:
         with self.connection() as conn:
             rows = conn.execute(
-                "SELECT request_id FROM signal_requests ORDER BY updated_at DESC LIMIT ?",
+                self.adapter.prepare_sql("SELECT request_id FROM signal_requests ORDER BY updated_at DESC LIMIT ?"),
                 (limit,),
             ).fetchall()
         records: list[SignalRecord] = []
@@ -261,7 +274,8 @@ class Storage:
         timestamp = datetime.now(timezone.utc).isoformat()
         with self.connection() as conn:
             conn.execute(
-                """
+                self.adapter.prepare_sql(
+                    """
                 INSERT INTO opportunity_alpaca_orders (
                     request_id, symbol, alpaca_order_json, alpaca_order_status, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?)
@@ -269,7 +283,8 @@ class Storage:
                     alpaca_order_json = excluded.alpaca_order_json,
                     alpaca_order_status = excluded.alpaca_order_status,
                     updated_at = excluded.updated_at
-                """,
+                """
+                ),
                 (
                     request_id,
                     symbol.upper(),
@@ -283,11 +298,13 @@ class Storage:
     def get_opportunity_alpaca_order(self, request_id: str, symbol: str) -> AlpacaOrderIntent | None:
         with self.connection() as conn:
             row = conn.execute(
-                """
+                self.adapter.prepare_sql(
+                    """
                 SELECT alpaca_order_json
                 FROM opportunity_alpaca_orders
                 WHERE request_id = ? AND symbol = ?
-                """,
+                """
+                ),
                 (request_id, symbol.upper()),
             ).fetchone()
         if row is None:
@@ -297,12 +314,14 @@ class Storage:
     def list_opportunity_alpaca_orders(self, request_id: str) -> dict[str, AlpacaOrderIntent]:
         with self.connection() as conn:
             rows = conn.execute(
-                """
+                self.adapter.prepare_sql(
+                    """
                 SELECT symbol, alpaca_order_json
                 FROM opportunity_alpaca_orders
                 WHERE request_id = ?
                 ORDER BY symbol ASC
-                """,
+                """
+                ),
                 (request_id,),
             ).fetchall()
         return {
@@ -313,14 +332,19 @@ class Storage:
     def replace_universe_scan_candidates(self, request_id: str, candidates: list[UniverseScanCandidateRecord]) -> None:
         timestamp = datetime.now(timezone.utc).isoformat()
         with self.connection() as conn:
-            conn.execute("DELETE FROM universe_scan_candidates WHERE request_id = ?", (request_id,))
+            conn.execute(
+                self.adapter.prepare_sql("DELETE FROM universe_scan_candidates WHERE request_id = ?"),
+                (request_id,),
+            )
             conn.executemany(
-                """
+                self.adapter.prepare_sql(
+                    """
                 INSERT INTO universe_scan_candidates (
                     request_id, symbol, score, reasons_json, selected_for_deep_eval,
                     rank_position, evaluation_status, rejection_reason, created_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+                """
+                ),
                 [
                     (
                         candidate.request_id,
@@ -340,7 +364,8 @@ class Storage:
     def get_universe_scan_candidates(self, request_id: str) -> list[UniverseScanCandidateRecord]:
         with self.connection() as conn:
             rows = conn.execute(
-                """
+                self.adapter.prepare_sql(
+                    """
                 SELECT request_id, symbol, score, reasons_json, selected_for_deep_eval,
                        rank_position, evaluation_status, rejection_reason
                 FROM universe_scan_candidates
@@ -350,7 +375,8 @@ class Storage:
                     rank_position ASC,
                     score DESC,
                     symbol ASC
-                """,
+                """
+                ),
                 (request_id,),
             ).fetchall()
         return [

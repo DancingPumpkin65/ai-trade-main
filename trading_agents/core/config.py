@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     env: str = Field(default="dev", alias="ENV")
     data_dir: Path = Path("./data")
     db_path: Path = Field(default=Path("./data/trading.db"), alias="DB_PATH")
+    database_url: str | None = Field(default=None, alias="DATABASE_URL")
 
     drahmi_api_key: str | None = Field(default=None, alias="DRAHMI_API_KEY")
     drahmi_base_url: str = Field(default="https://api.drahmi.app/api", alias="DRAHMI_BASE_URL")
@@ -51,6 +52,7 @@ def get_settings() -> Settings:
     settings = Settings()
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.chroma_persist_dir.mkdir(parents=True, exist_ok=True)
-    settings.db_path.parent.mkdir(parents=True, exist_ok=True)
+    if not settings.database_url:
+        settings.db_path.parent.mkdir(parents=True, exist_ok=True)
     settings.langgraph_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     return settings

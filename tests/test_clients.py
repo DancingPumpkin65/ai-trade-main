@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from trading_agents.core.data.bourse_fetcher import BourseDataFetcher, PdfTarget
-from trading_agents.core.data.drahmi import DrahmiClient
+from trading_agents.core.data.drahmi import DrahmiClient, DrahmiSchemaError
 from trading_agents.core.data.news_global import MarketAuxClient
 from trading_agents.core.models import StockInfo
 
@@ -69,6 +69,83 @@ async def test_drahmi_get_raises_runtime_error_on_404(monkeypatch):
 
     with pytest.raises(RuntimeError, match="status 404"):
         await client._get("/stocks/ATW")
+
+
+@pytest.mark.asyncio
+async def test_drahmi_list_stocks_raises_schema_error_on_missing_data_array(monkeypatch):
+    client = DrahmiClient("https://api.drahmi.app/api", api_key="secret", daily_limit=10)
+
+    async def fake_get(path: str, params: dict | None = None):
+        return {"items": [{"symbol": "ATW", "price": 520.0}]}
+
+    monkeypatch.setattr(client, "_get", fake_get)
+
+    with pytest.raises(DrahmiSchemaError, match="must contain a 'data' array"):
+        await client.list_stocks()
+
+
+@pytest.mark.asyncio
+async def test_drahmi_get_stock_raises_schema_error_on_missing_symbol(monkeypatch):
+    client = DrahmiClient("https://api.drahmi.app/api", api_key="secret", daily_limit=10)
+
+    async def fake_get(path: str, params: dict | None = None):
+        if path.endswith("/history"):
+            return {"data": [{"date": "2026-04-24", "open": 100, "high": 101, "low": 99, "close": 100.5, "volume": 1234}]}
+        return {"name": "Attijariwafa Bank", "price": 520.0}
+
+    monkeypatch.setattr(client, "_get", fake_get)
+
+    with pytest.raises(DrahmiSchemaError, match="missing required field 'symbol'"):
+        await client.get_stock("ATW")
+
+
+@pytest.mark.asyncio
+async def test_drahmi_get_stock_raises_schema_error_on_malformed_history_row(monkeypatch):
+    client = DrahmiClient("https://api.drahmi.app/api", api_key="secret", daily_limit=10)
+
+    async def fake_get(path: str, params: dict | None = None):
+        if path.endswith("/history"):
+            return {"data": [{"date": "2026-04-24", "open": 100, "high": 101, "low": 99, "volume": 1234}]}
+        return {"symbol": "ATW", "name": "Attijariwafa Bank", "price": 520.0}
+
+    monkeypatch.setattr(client, "_get", fake_get)
+
+    with pytest.raises(DrahmiSchemaError, match="missing required field 'close'"):
+        await client.get_stock("ATW")
+
+
+@pytest.mark.asyncio
+async def test_drahmi_get_stock_accepts_valid_string_numeric_payloads(monkeypatch):
+    client = DrahmiClient("https://api.drahmi.app/api", api_key="secret", daily_limit=10)
+
+    async def fake_get(path: str, params: dict | None = None):
+        if path.endswith("/history"):
+            return {
+                "data": [
+                    {"day": "2026-04-24", "o": "100.1", "h": "101.2", "l": "99.8", "c": "100.7", "v": "1500"},
+                    {"day": "2026-04-25", "o": "100.7", "h": "102.0", "l": "100.0", "c": "101.5", "v": "1700"},
+                ]
+            }
+        return {
+            "ticker": "ATW",
+            "name": "Attijariwafa Bank",
+            "sector": "Banks",
+            "market_cap": "98000000000",
+            "last_price": "520.0",
+            "last_volume": "2500000",
+            "high_52w": "560.0",
+            "low_52w": "430.0",
+            "market_mode": "continuous",
+        }
+
+    monkeypatch.setattr(client, "_get", fake_get)
+
+    stock = await client.get_stock("ATW")
+
+    assert stock.symbol == "ATW"
+    assert stock.last_price == 520.0
+    assert stock.ohlcv[0]["open"] == 100.1
+    assert len(stock.ohlcv) == 2
 
 
 @pytest.mark.asyncio

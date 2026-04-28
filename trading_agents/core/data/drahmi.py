@@ -19,6 +19,22 @@ SAMPLE_STOCKS = [
 ]
 
 
+class DrahmiClientError(RuntimeError):
+    pass
+
+
+class DrahmiAuthError(DrahmiClientError):
+    pass
+
+
+class DrahmiNotFoundError(DrahmiClientError):
+    pass
+
+
+class DrahmiSchemaError(DrahmiClientError):
+    pass
+
+
 class DrahmiClient:
     def __init__(self, base_url: str, api_key: str | None, daily_limit: int = 500):
         self.base_url = base_url.rstrip("/")
@@ -41,14 +57,19 @@ class DrahmiClient:
     async def _get(self, path: str, params: dict | None = None) -> dict | list:
         self._check_limit()
         if not self.api_key:
-            raise RuntimeError("DRAHMI_API_KEY is not configured.")
+            raise DrahmiClientError("DRAHMI_API_KEY is not configured.")
         headers = {"Authorization": f"Bearer {self.api_key}"}
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(f"{self.base_url}{path}", params=params, headers=headers)
-        if response.status_code in {401, 403, 404}:
-            raise RuntimeError(f"Drahmi request failed with status {response.status_code}: {response.text}")
+        if response.status_code in {401, 403}:
+            raise DrahmiAuthError(f"Drahmi request failed with status {response.status_code}: {response.text}")
+        if response.status_code == 404:
+            raise DrahmiNotFoundError(f"Drahmi request failed with status {response.status_code}: {response.text}")
         response.raise_for_status()
-        return response.json()
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise DrahmiSchemaError(f"Drahmi returned invalid JSON for path '{path}'.") from exc
 
     async def list_stocks(self) -> list[StockInfo]:
         if not self.api_key:
@@ -57,11 +78,11 @@ class DrahmiClient:
         stocks: list[StockInfo] = []
         while True:
             payload = await self._get("/stocks", {"page": page})
-            data = payload if isinstance(payload, list) else payload.get("data", [])
+            data = self._coerce_stock_rows(payload, context=f"/stocks page {page}")
             if not data:
                 break
             for item in data:
-                stocks.append(self._payload_to_stock(item))
+                stocks.append(self._payload_to_stock(item, context=f"/stocks page {page}"))
             page += 1
         return stocks
 
@@ -74,22 +95,29 @@ class DrahmiClient:
             return self._sample_to_stock(sample)
         stock_payload = await self._get(f"/stocks/{symbol}")
         history_payload = await self._get(f"/stocks/{symbol}/history")
-        stock = self._payload_to_stock(stock_payload)
-        stock.ohlcv = self._normalize_history(history_payload)
+        stock = self._payload_to_stock(stock_payload, context=f"/stocks/{symbol}")
+        stock.ohlcv = self._normalize_history(
+            history_payload,
+            context=f"/stocks/{symbol}/history",
+            allow_empty=False,
+        )
         return stock
 
-    def _payload_to_stock(self, payload: dict) -> StockInfo:
-        symbol = payload.get("ticker") or payload.get("symbol") or "UNKNOWN"
+    def _payload_to_stock(self, payload: dict, *, context: str) -> StockInfo:
+        if not isinstance(payload, dict):
+            raise DrahmiSchemaError(f"{context} must be an object.")
+        symbol = self._require_string(payload, ("ticker", "symbol"), context=context, label="symbol")
+        last_price = self._require_float(payload, ("last_price", "price"), context=context, label="last_price")
         market_mode = self._extract_market_mode(payload)
         stock = StockInfo(
             symbol=symbol,
             name=payload.get("name", symbol),
             sector=payload.get("sector", "Unknown"),
-            market_cap=float(payload.get("market_cap") or 0.0),
-            last_price=float(payload.get("last_price") or payload.get("price") or 0.0),
-            last_volume=float(payload.get("last_volume") or payload.get("volume") or 0.0),
-            high_52w=float(payload.get("high_52w") or payload.get("fifty_two_week_high") or 0.0),
-            low_52w=float(payload.get("low_52w") or payload.get("fifty_two_week_low") or 0.0),
+            market_cap=self._optional_float(payload, ("market_cap",), default=0.0, context=context),
+            last_price=last_price,
+            last_volume=self._optional_float(payload, ("last_volume", "volume"), default=0.0, context=context),
+            high_52w=self._optional_float(payload, ("high_52w", "fifty_two_week_high"), default=0.0, context=context),
+            low_52w=self._optional_float(payload, ("low_52w", "fifty_two_week_low"), default=0.0, context=context),
             market_mode=market_mode,
             market_metadata={
                 "market_mode": payload.get("market_mode"),
@@ -99,7 +127,11 @@ class DrahmiClient:
                 "asset_type": payload.get("asset_type"),
                 "compartment": payload.get("compartment"),
             },
-            ohlcv=self._normalize_history(payload.get("history", [])),
+            ohlcv=self._normalize_history(
+                payload.get("history", []),
+                context=f"{context} inline history",
+                allow_empty=True,
+            ),
         )
         return stock
 
@@ -161,18 +193,83 @@ class DrahmiClient:
             )
         return bars
 
-    def _normalize_history(self, payload: list | dict) -> list[dict]:
-        rows = payload if isinstance(payload, list) else payload.get("data", [])
+    def _coerce_stock_rows(self, payload: list | dict, *, context: str) -> list[dict]:
+        if isinstance(payload, list):
+            rows = payload
+        elif isinstance(payload, dict):
+            data = payload.get("data")
+            if data is None:
+                raise DrahmiSchemaError(f"{context} must contain a 'data' array.")
+            rows = data
+        else:
+            raise DrahmiSchemaError(f"{context} must be an array or object with a 'data' array.")
+        if not isinstance(rows, list):
+            raise DrahmiSchemaError(f"{context} data must be an array.")
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                raise DrahmiSchemaError(f"{context} row {index} must be an object.")
+        return rows
+
+    def _normalize_history(self, payload: list | dict, *, context: str, allow_empty: bool) -> list[dict]:
+        rows = self._coerce_history_rows(payload, context=context)
+        if not rows and not allow_empty:
+            raise DrahmiSchemaError(f"{context} returned no history rows.")
         normalized = []
-        for row in rows:
+        for index, row in enumerate(rows):
             normalized.append(
                 {
-                    "date": row.get("date") or row.get("day"),
-                    "open": float(row.get("open") or row.get("o") or 0.0),
-                    "high": float(row.get("high") or row.get("h") or 0.0),
-                    "low": float(row.get("low") or row.get("l") or 0.0),
-                    "close": float(row.get("close") or row.get("c") or 0.0),
-                    "volume": float(row.get("volume") or row.get("v") or 0.0),
+                    "date": self._require_string(row, ("date", "day"), context=f"{context} row {index}", label="date"),
+                    "open": self._require_float(row, ("open", "o"), context=f"{context} row {index}", label="open"),
+                    "high": self._require_float(row, ("high", "h"), context=f"{context} row {index}", label="high"),
+                    "low": self._require_float(row, ("low", "l"), context=f"{context} row {index}", label="low"),
+                    "close": self._require_float(row, ("close", "c"), context=f"{context} row {index}", label="close"),
+                    "volume": self._optional_float(row, ("volume", "v"), default=0.0, context=f"{context} row {index}"),
                 }
             )
         return normalized
+
+    def _coerce_history_rows(self, payload: list | dict, *, context: str) -> list[dict]:
+        if isinstance(payload, list):
+            rows = payload
+        elif isinstance(payload, dict):
+            data = payload.get("data")
+            if data is None:
+                raise DrahmiSchemaError(f"{context} must contain a 'data' array.")
+            rows = data
+        else:
+            raise DrahmiSchemaError(f"{context} must be an array or object with a 'data' array.")
+        if not isinstance(rows, list):
+            raise DrahmiSchemaError(f"{context} data must be an array.")
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                raise DrahmiSchemaError(f"{context} row {index} must be an object.")
+        return rows
+
+    def _require_string(self, payload: dict, keys: tuple[str, ...], *, context: str, label: str) -> str:
+        for key in keys:
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        raise DrahmiSchemaError(f"{context} is missing required field '{label}'.")
+
+    def _require_float(self, payload: dict, keys: tuple[str, ...], *, context: str, label: str) -> float:
+        for key in keys:
+            value = payload.get(key)
+            if value is None or value == "":
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError) as exc:
+                raise DrahmiSchemaError(f"{context} field '{key}' must be numeric.") from exc
+        raise DrahmiSchemaError(f"{context} is missing required field '{label}'.")
+
+    def _optional_float(self, payload: dict, keys: tuple[str, ...], *, default: float, context: str) -> float:
+        for key in keys:
+            value = payload.get(key)
+            if value is None or value == "":
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError) as exc:
+                raise DrahmiSchemaError(f"{context} field '{key}' must be numeric.") from exc
+        return default

@@ -3,12 +3,53 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+import httpx
 
 from trading_agents.api.deps import get_services
 from trading_agents.api.main import app
 from trading_agents.core.models import GenerateSignalRequest, NewsChunk, RiskOutput, StockInfo
 from trading_agents.graph import build as graph_build
 from trading_agents.graph.technical_node import run_technical_agent as actual_run_technical_agent
+
+
+class _AlpacaSubmissionResponse:
+    def __init__(self, *, url: str, status_code: int, payload: dict):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = json.dumps(payload)
+        self.request = httpx.Request("POST", url)
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                "Request failed",
+                request=self.request,
+                response=httpx.Response(self.status_code, request=self.request, json=self._payload),
+            )
+
+
+class _AlpacaSubmissionClient:
+    def __init__(self, *, base_url: str, headers: dict, timeout: float, get_response, post_response):
+        self.base_url = base_url
+        self.headers = headers
+        self.timeout = timeout
+        self.get_response = get_response
+        self.post_response = post_response
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return None
+
+    def get(self, path: str):
+        return self.get_response
+
+    def post(self, path: str, json: dict):
+        return self.post_response
 
 
 def _configure_env(tmp_path: Path, monkeypatch) -> None:
@@ -340,6 +381,123 @@ def test_full_access_mode_auto_approves_prepared_alpaca_command(tmp_path: Path, 
 
     events = services.stream_events(request_id)
     assert any(event["event_type"] == "alpaca_order_auto_approved" for event in events)
+
+
+def test_order_approval_submits_to_alpaca_when_enabled(tmp_path: Path, monkeypatch):
+    _configure_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("ALPACA_SUBMIT_ORDERS", "true")
+    monkeypatch.setenv("ALPACA_API_KEY_ID", "paper-key")
+    monkeypatch.setenv("ALPACA_API_SECRET_KEY", "paper-secret")
+    get_services.cache_clear()
+    client = TestClient(app)
+    services = get_services()
+    services.graph_service.alpaca_preview_service.register_symbol_mapping("ATW", "SPY")
+
+    get_response = _AlpacaSubmissionResponse(
+        url="https://paper-api.alpaca.markets/v2/assets/SPY",
+        status_code=200,
+        payload={"symbol": "SPY", "status": "active", "tradable": True, "fractionable": True},
+    )
+    post_response = _AlpacaSubmissionResponse(
+        url="https://paper-api.alpaca.markets/v2/orders",
+        status_code=200,
+        payload={"id": "alpaca-submit-1", "status": "accepted"},
+    )
+    services.alpaca_preview_service.client_factory = lambda **kwargs: _AlpacaSubmissionClient(
+        get_response=get_response,
+        post_response=post_response,
+        **kwargs,
+    )
+
+    async def fake_get_stock(symbol: str):
+        return _volatile_stock(symbol)
+
+    def fake_run_risk_agent(*, symbol, capital, sentiment_output, technical_output, technical_features, request_intent):
+        return RiskOutput(
+            action="BUY",
+            position_size_pct=0.03,
+            position_value_mad=capital * 0.03,
+            stop_loss_pct=0.05,
+            take_profit_pct=0.08,
+            risk_score=0.72,
+            volatility_estimate=0.65,
+            rationale="Forced BUY risk output for broker submit integration test.",
+        )
+
+    services.graph_service.drahmi_client.get_stock = fake_get_stock
+    monkeypatch.setattr(graph_build, "run_risk_agent", fake_run_risk_agent)
+
+    response = client.post("/signals/generate", json={"prompt": "Analyze ATW"})
+    assert response.status_code == 200
+    request_id = response.json()["request_id"]
+
+    approved = client.post(f"/signals/{request_id}/approve")
+    assert approved.status_code == 200
+    payload = approved.json()
+    assert payload["alpaca_order_status"] == "APPROVED"
+    assert payload["alpaca_order"]["preview_only"] is False
+    assert payload["alpaca_order"]["submission_eligible"] is True
+    assert payload["alpaca_order"]["broker_order_id"] == "alpaca-submit-1"
+    assert payload["alpaca_order"]["broker_order_status"] == "accepted"
+    assert payload["alpaca_order"]["broker_submission_mode"] == "paper"
+
+
+def test_full_access_mode_auto_submits_when_enabled(tmp_path: Path, monkeypatch):
+    _configure_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("ALPACA_REQUIRE_ORDER_APPROVAL", "false")
+    monkeypatch.setenv("ALPACA_SUBMIT_ORDERS", "true")
+    monkeypatch.setenv("ALPACA_API_KEY_ID", "paper-key")
+    monkeypatch.setenv("ALPACA_API_SECRET_KEY", "paper-secret")
+    get_services.cache_clear()
+    client = TestClient(app)
+    services = get_services()
+    services.graph_service.alpaca_preview_service.register_symbol_mapping("ATW", "SPY")
+
+    get_response = _AlpacaSubmissionResponse(
+        url="https://paper-api.alpaca.markets/v2/assets/SPY",
+        status_code=200,
+        payload={"symbol": "SPY", "status": "active", "tradable": True, "fractionable": True},
+    )
+    post_response = _AlpacaSubmissionResponse(
+        url="https://paper-api.alpaca.markets/v2/orders",
+        status_code=200,
+        payload={"id": "alpaca-submit-2", "status": "accepted"},
+    )
+    services.alpaca_preview_service.client_factory = lambda **kwargs: _AlpacaSubmissionClient(
+        get_response=get_response,
+        post_response=post_response,
+        **kwargs,
+    )
+
+    async def fake_get_stock(symbol: str):
+        return _volatile_stock(symbol)
+
+    def fake_run_risk_agent(*, symbol, capital, sentiment_output, technical_output, technical_features, request_intent):
+        return RiskOutput(
+            action="BUY",
+            position_size_pct=0.03,
+            position_value_mad=capital * 0.03,
+            stop_loss_pct=0.05,
+            take_profit_pct=0.08,
+            risk_score=0.72,
+            volatility_estimate=0.65,
+            rationale="Forced BUY risk output for auto-submit integration test.",
+        )
+
+    services.graph_service.drahmi_client.get_stock = fake_get_stock
+    monkeypatch.setattr(graph_build, "run_risk_agent", fake_run_risk_agent)
+
+    response = client.post("/signals/generate", json={"prompt": "Analyze ATW"})
+    assert response.status_code == 200
+    request_id = response.json()["request_id"]
+
+    detail = client.get(f"/signals/{request_id}")
+    assert detail.status_code == 200
+    payload = detail.json()
+    assert payload["alpaca_order_status"] == "APPROVED"
+    assert payload["alpaca_order"]["preview_only"] is False
+    assert payload["alpaca_order"]["submission_eligible"] is True
+    assert payload["alpaca_order"]["broker_order_id"] == "alpaca-submit-2"
 
 
 def test_technical_bias_mismatch_retries_then_recovers(tmp_path: Path, monkeypatch):

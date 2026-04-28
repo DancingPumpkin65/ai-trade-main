@@ -3,7 +3,7 @@ from __future__ import annotations
 import httpx
 
 from trading_agents.core.broker.alpaca import AlpacaPreviewService
-from trading_agents.core.models import AlpacaOrderStatus, TradingSignal
+from trading_agents.core.models import AlpacaOrderIntent, AlpacaOrderStatus, TradingSignal
 
 
 class FakeResponse:
@@ -25,12 +25,24 @@ class FakeResponse:
 
 
 class FakeClient:
-    def __init__(self, *, base_url: str, headers: dict, timeout: float, response: FakeResponse | None = None, exception: Exception | None = None):
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        headers: dict,
+        timeout: float,
+        response: FakeResponse | None = None,
+        post_response: FakeResponse | None = None,
+        exception: Exception | None = None,
+        post_exception: Exception | None = None,
+    ):
         self.base_url = base_url
         self.headers = headers
         self.timeout = timeout
         self.response = response
+        self.post_response = post_response
         self.exception = exception
+        self.post_exception = post_exception
 
     def __enter__(self):
         return self
@@ -44,6 +56,13 @@ class FakeClient:
         if self.response is None:
             raise AssertionError(f"No fake response configured for {path}")
         return self.response
+
+    def post(self, path: str, json: dict):
+        if self.post_exception is not None:
+            raise self.post_exception
+        if self.post_response is None:
+            raise AssertionError(f"No fake POST response configured for {path} with payload {json}")
+        return self.post_response
 
 
 def _signal(symbol: str = "ATW", action: str = "BUY") -> TradingSignal:
@@ -151,3 +170,86 @@ def test_prepare_preview_marks_api_failures_as_unmappable():
 
     assert preview.status == AlpacaOrderStatus.UNMAPPABLE
     assert "unable to validate" in (preview.reason or "").lower()
+
+
+def test_submit_order_records_broker_submission_metadata():
+    post_response = FakeResponse(
+        url="https://paper-api.alpaca.markets/v2/orders",
+        status_code=200,
+        payload={"id": "alpaca-order-1", "status": "accepted"},
+    )
+    service = AlpacaPreviewService(
+        enabled=True,
+        api_key_id="key",
+        api_secret_key="secret",
+        client_factory=lambda **kwargs: FakeClient(post_response=post_response, **kwargs),
+    )
+
+    order = service.approve_preview(
+        AlpacaOrderIntent.model_validate(
+            {
+                "request_id": "req-123",
+                "client_order_id": "req-123",
+                "source_symbol": "ATW",
+                "alpaca_symbol": "SPY",
+                "side": "buy",
+                "type": "market",
+                "time_in_force": "day",
+                "notional": 3000.0,
+                "preview_only": True,
+                "submission_eligible": False,
+                "status": "PREPARED",
+                "created_at": "2026-04-27T00:00:00+00:00",
+            }
+        ),
+        submission_enabled=True,
+    )
+
+    submitted = service.submit_order(order)
+
+    assert submitted.preview_only is False
+    assert submitted.submission_eligible is True
+    assert submitted.broker_order_id == "alpaca-order-1"
+    assert submitted.broker_order_status == "accepted"
+    assert submitted.broker_submission_mode == "paper"
+    assert submitted.reason == "Submitted to Alpaca paper trading."
+
+
+def test_submit_order_raises_on_broker_rejection():
+    post_response = FakeResponse(
+        url="https://paper-api.alpaca.markets/v2/orders",
+        status_code=403,
+        payload={"message": "account not authorized"},
+    )
+    service = AlpacaPreviewService(
+        enabled=True,
+        api_key_id="key",
+        api_secret_key="secret",
+        client_factory=lambda **kwargs: FakeClient(post_response=post_response, **kwargs),
+    )
+
+    order = service.approve_preview(
+        AlpacaOrderIntent.model_validate(
+            {
+                "request_id": "req-123",
+                "client_order_id": "req-123",
+                "source_symbol": "ATW",
+                "alpaca_symbol": "SPY",
+                "side": "buy",
+                "type": "market",
+                "time_in_force": "day",
+                "notional": 3000.0,
+                "preview_only": True,
+                "submission_eligible": False,
+                "status": "PREPARED",
+                "created_at": "2026-04-27T00:00:00+00:00",
+            }
+        ),
+        submission_enabled=True,
+    )
+
+    try:
+        service.submit_order(order)
+        assert False, "Expected submission failure"
+    except ValueError as exc:
+        assert "submission failed" in str(exc).lower()

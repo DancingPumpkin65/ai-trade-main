@@ -8,6 +8,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from trading_agents.api.deps import ServicesDep, get_current_username
 from trading_agents.core.models import GenerateSignalRequest, RiskPreference, SignalStatus, TimeHorizon
+from trading_agents.core.services import ServiceRequestError
 
 
 router = APIRouter(
@@ -21,6 +22,8 @@ router = APIRouter(
 def generate(payload: GenerateSignalRequest, services: ServicesDep):
     try:
         return services.generate(payload).model_dump(mode="json")
+    except ServiceRequestError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

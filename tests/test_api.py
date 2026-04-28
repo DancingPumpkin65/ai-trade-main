@@ -719,6 +719,58 @@ def test_agent_iteration_cap_falls_back_safely(tmp_path: Path, monkeypatch):
     assert payload["final_signal"]["action"] == "HOLD"
 
 
+def test_sentiment_agent_expands_retrieval_queries_when_initial_results_are_weak(tmp_path: Path, monkeypatch):
+    _configure_env(tmp_path, monkeypatch)
+    client = TestClient(app)
+    _authenticate_client(client)
+    services = get_services()
+
+    search_queries: list[str] = []
+
+    def fake_search_news(query, top_k=8, filters=None, metadata=None):
+        search_queries.append(query)
+        if "dividend earnings" in query:
+            return [
+                NewsChunk(
+                    chunk_id="atw-dividend",
+                    text="ATW annonce un dividende et une hausse de resultat.",
+                    source="Casablanca Bourse PDF",
+                    published_at=datetime.now(timezone.utc) - timedelta(days=1),
+                    similarity_score=0.92,
+                    url="https://example.com/atw-dividend",
+                    metadata={"doc_type": "corporate_notices", "ticker": "ATW"},
+                ),
+                NewsChunk(
+                    chunk_id="atw-growth",
+                    text="ATW publie une croissance des revenus.",
+                    source="MarketAux",
+                    published_at=datetime.now(timezone.utc) - timedelta(days=2),
+                    similarity_score=0.88,
+                    url="https://example.com/atw-growth",
+                    metadata={"doc_type": "news", "ticker": "ATW"},
+                ),
+            ]
+        return []
+
+    services.graph_service.retriever.search_news = fake_search_news
+
+    response = client.post("/signals/generate", json={"prompt": "Analyze ATW with conservative risk"})
+    assert response.status_code == 200
+    request_id = response.json()["request_id"]
+
+    events = services.stream_events(request_id)
+    sentiment_search_calls = [
+        event["payload"]["args"]["query"]
+        for event in events
+        if event["event_type"] == "tool_call" and event["payload"].get("tool") == "search_news"
+    ]
+
+    assert len(sentiment_search_calls) >= 3
+    assert sentiment_search_calls[0] == "ATW Morocco"
+    assert "ATW corporate notice Morocco" in sentiment_search_calls
+    assert "ATW dividend earnings Morocco" in sentiment_search_calls
+
+
 def test_universe_scan_ranking_prefers_fresh_notice_candidate(tmp_path: Path, monkeypatch):
     _configure_env(tmp_path, monkeypatch)
     services = get_services()
